@@ -19,7 +19,6 @@
 #include <bthread/unstable.h>
 #include <butil/logging.h>
 #include <gflags/gflags.h>
-#include <google/protobuf/stubs/common.h>
 
 #ifdef BLOCK_SIZE
 #undef BLOCK_SIZE
