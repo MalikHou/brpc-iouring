@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -83,6 +84,13 @@ bvar::Adder<int64_t> g_iouring_harvest_wake_error_total(
     "file_read_iouring_harvest_wake_error_total");
 bvar::PerSecond<bvar::Adder<int64_t>> g_iouring_harvest_wake_error_qps(
     "file_read_iouring_harvest_wake_error_qps", &g_iouring_harvest_wake_error_total);
+bvar::Adder<int64_t> g_iouring_wait_orphan_total("file_read_iouring_wait_orphan_total");
+bvar::PerSecond<bvar::Adder<int64_t>> g_iouring_wait_orphan_qps(
+    "file_read_iouring_wait_orphan_qps", &g_iouring_wait_orphan_total);
+bvar::Adder<int64_t> g_iouring_orphan_recycled_total(
+    "file_read_iouring_orphan_recycled_total");
+bvar::PerSecond<bvar::Adder<int64_t>> g_iouring_orphan_recycled_qps(
+    "file_read_iouring_orphan_recycled_qps", &g_iouring_orphan_recycled_total);
 bvar::Adder<int64_t> g_file_read_blocking_ops_total("file_read_blocking_ops_total");
 bvar::PerSecond<bvar::Adder<int64_t>> g_file_read_blocking_iops(
     "file_read_blocking_iops", &g_file_read_blocking_ops_total);
@@ -163,6 +171,8 @@ struct ReqCtx {
     io_result = 0;
     io_errno = 0;
     wake_errno = 0;
+    orphaned.store(false, std::memory_order_release);
+    returned_to_pool.store(false, std::memory_order_release);
     if (done_butex != nullptr) {
       static_cast<butil::atomic<int>*>(done_butex)->store(0,
                                                           butil::memory_order_release);
@@ -178,6 +188,8 @@ struct ReqCtx {
   ssize_t io_result = 0;
   int io_errno = 0;
   int wake_errno = 0;
+  std::atomic<bool> orphaned{false};
+  std::atomic<bool> returned_to_pool{true};
   ReqCtx* next_free = nullptr;
 };
 
@@ -219,6 +231,7 @@ class WorkerIoState {
       if (ctx->done_butex == nullptr) {
         return ENOMEM;
       }
+      ctx->returned_to_pool.store(true, std::memory_order_release);
       ctx->next_free = free_head_;
       free_head_ = ctx;
     }
@@ -249,6 +262,12 @@ class WorkerIoState {
 
   void ReleaseReqCtx(ReqCtx* req) {
     if (req == nullptr) {
+      return;
+    }
+    bool expected = false;
+    if (!req->returned_to_pool.compare_exchange_strong(expected, true,
+                                                       std::memory_order_acq_rel,
+                                                       std::memory_order_acquire)) {
       return;
     }
     req->next_free = free_head_;
@@ -300,6 +319,8 @@ class WorkerIoState {
       g_iouring_harvest_cqe_total << n;
       unsigned advanced = 0;
       bool blocked_on_wake_eagain = false;
+      std::vector<ReqCtx*> recycled_reqs;
+      recycled_reqs.reserve(n);
       for (unsigned i = 0; i < n; ++i) {
         io_uring_cqe* cqe = cqes[i];
         ReqCtx* req = static_cast<ReqCtx*>(io_uring_cqe_get_data(cqe));
@@ -311,27 +332,37 @@ class WorkerIoState {
             req->io_result = -1;
             req->io_errno = -cqe->res;
           }
+          const bool orphaned = req->orphaned.load(std::memory_order_acquire);
+          if (!orphaned) {
+            const int wake_rc = bthread_butex_wake_within(wake_ctx, req->done_butex);
+            if (wake_rc == 1 || wake_rc == 0) {
+              if (wake_rc == 1) {
+                made_progress = true;
+              }
+            } else if (wake_rc == -1 && errno == EAGAIN) {
+              g_iouring_harvest_wake_eagain_total << 1;
+              // pin_rq is temporarily full: keep this CQE for next harvest retry.
+              blocked_on_wake_eagain = true;
+              break;
+            } else {
+              g_iouring_harvest_wake_error_total << 1;
+              req->wake_errno = errno;
+            }
+          }
           static_cast<butil::atomic<int>*>(req->done_butex)
               ->store(1, butil::memory_order_release);
-          const int wake_rc = bthread_butex_wake_within(wake_ctx, req->done_butex);
-          if (wake_rc == 1 || wake_rc == 0) {
-            if (wake_rc == 1) {
-              made_progress = true;
-            }
-          } else if (wake_rc == -1 && errno == EAGAIN) {
-            g_iouring_harvest_wake_eagain_total << 1;
-            // pin_rq is temporarily full: keep this CQE for next harvest.
-            blocked_on_wake_eagain = true;
-            break;
-          } else {
-            g_iouring_harvest_wake_error_total << 1;
-            req->wake_errno = errno;
+          if (orphaned) {
+            recycled_reqs.push_back(req);
           }
         }
         ++advanced;
       }
       if (advanced > 0) {
         io_uring_cq_advance(&ring_, advanced);
+        for (ReqCtx* req : recycled_reqs) {
+          ReleaseReqCtx(req);
+          g_iouring_orphan_recycled_total << 1;
+        }
         made_progress = true;
       }
       if (blocked_on_wake_eagain) {
@@ -500,6 +531,19 @@ class FileReadServiceImpl : public iouring_file_read::FileReadService {
             ->load(butil::memory_order_acquire);
     if (wait_rc != 0 && errno != EWOULDBLOCK && butex_value == 0) {
       const int saved_errno = errno;
+      // CQE may still arrive later. Keep this ReqCtx out of freelist to avoid
+      // stale CQE writing into a reused context.
+      request_ctx->orphaned.store(true, std::memory_order_release);
+      releaser.req = nullptr;
+      g_iouring_wait_orphan_total << 1;
+      // Race fix: CQE may have just completed and been advanced before orphaned
+      // became visible to harvest. Opportunistically reclaim here.
+      const int done_after_orphan =
+          static_cast<butil::atomic<int>*>(request_ctx->done_butex)
+              ->load(butil::memory_order_acquire);
+      if (done_after_orphan == 1) {
+        g_worker_io->ReleaseReqCtx(request_ctx);
+      }
       if (saved_errno == ETIMEDOUT) {
         resp->set_code(iouring_file_read::FILE_READ_TIMEOUT);
         resp->set_message("wait_local timeout");
