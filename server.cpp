@@ -32,11 +32,15 @@
 DECLARE_int32(task_group_ntags);
 
 DEFINE_int32(port, 8002, "Server listen port");
+DEFINE_int32(blocking_port, 8042, "Blocking-read server listen port");
 DEFINE_int32(monitor_port, 8003, "Builtin monitor service port");
 DEFINE_int32(read_tag, 1, "bthread tag for file read requests");
+DEFINE_int32(blocking_tag, 2, "bthread tag for blocking file read requests");
 DEFINE_int32(monitor_tag, 0, "bthread tag for monitor builtin services");
 DEFINE_int32(read_num_threads, 12,
              "pthread workers hint for read server (default: 12)");
+DEFINE_int32(blocking_num_threads, 12,
+             "pthread workers hint for blocking read server; <0 means follow read_num_threads");
 DEFINE_int32(monitor_num_threads, 4,
              "pthread workers hint for monitor server (default: 4)");
 DEFINE_string(file_path, "/tmp/iouring-read-default.txt",
@@ -62,6 +66,9 @@ namespace {
 bvar::Adder<int64_t> g_file_read_ops_total("file_read_ops_total");
 bvar::PerSecond<bvar::Adder<int64_t>> g_file_read_iops("file_read_iops",
                                                        &g_file_read_ops_total);
+bvar::Adder<int64_t> g_file_read_blocking_ops_total("file_read_blocking_ops_total");
+bvar::PerSecond<bvar::Adder<int64_t>> g_file_read_blocking_iops(
+    "file_read_blocking_iops", &g_file_read_blocking_ops_total);
 
 struct ReqCtx {
   ReqCtx() : done_butex(bthread::butex_create()) {
@@ -434,6 +441,68 @@ class FileReadServiceImpl : public iouring_file_read::FileReadService {
   }
 };
 
+class BlockingFileReadServiceImpl : public iouring_file_read::BlockingFileReadService {
+ public:
+  void Read(::google::protobuf::RpcController* cntl_base,
+            const iouring_file_read::FileReadRequest* req,
+            iouring_file_read::FileReadResponse* resp,
+            ::google::protobuf::Closure* done) override {
+    brpc::ClosureGuard done_guard(done);
+
+    if (req->offset() < 0) {
+      return SetInvalidArgument(resp, "offset must be non-negative");
+    }
+    if (req->len() <= 0) {
+      return SetInvalidArgument(resp, "len must be positive");
+    }
+    if (req->len() > FLAGS_max_read_len) {
+      return SetInvalidArgument(resp, "len exceeds max_read_len");
+    }
+    if (req->offset() >
+        (std::numeric_limits<int64_t>::max() - static_cast<int64_t>(req->len()))) {
+      return SetInvalidArgument(resp, "offset + len overflow");
+    }
+
+    const std::string path = !req->path().empty() ? req->path() : FLAGS_file_path;
+    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+      return SetIoError(resp, errno, "open failed");
+    }
+
+    std::string body(static_cast<size_t>(req->len()), '\0');
+    const ssize_t n = pread(fd, &body[0], static_cast<size_t>(req->len()),
+                            static_cast<off_t>(req->offset()));
+    const int saved_errno = errno;
+    close(fd);
+
+    if (n < 0) {
+      return SetIoError(resp, saved_errno, "pread failed");
+    }
+
+    body.resize(static_cast<size_t>(n));
+    g_file_read_blocking_ops_total << 1;
+    resp->set_code(iouring_file_read::FILE_READ_OK);
+    resp->set_message("ok");
+    resp->set_body(body);
+    (void)cntl_base;
+  }
+
+ private:
+  void SetInvalidArgument(iouring_file_read::FileReadResponse* resp,
+                          const std::string& msg) {
+    resp->set_code(iouring_file_read::FILE_READ_INVALID_ARGUMENT);
+    resp->set_message(msg);
+    resp->clear_body();
+  }
+
+  void SetIoError(iouring_file_read::FileReadResponse* resp, int err,
+                  const std::string& prefix) {
+    resp->set_code(err);
+    resp->set_message(prefix + ": " + std::string(strerror(err)));
+    resp->clear_body();
+  }
+};
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -451,7 +520,17 @@ int main(int argc, char* argv[]) {
                  << kMinTagConcurrency;
     FLAGS_monitor_num_threads = kMinTagConcurrency;
   }
-  const int needed_ntags = std::max(FLAGS_read_tag, FLAGS_monitor_tag) + 1;
+  if (FLAGS_blocking_num_threads < 0) {
+    FLAGS_blocking_num_threads = FLAGS_read_num_threads;
+  }
+  if (FLAGS_blocking_num_threads < kMinTagConcurrency) {
+    LOG(WARNING) << "blocking_num_threads(" << FLAGS_blocking_num_threads
+                 << ") < " << kMinTagConcurrency << ", bump to "
+                 << kMinTagConcurrency;
+    FLAGS_blocking_num_threads = kMinTagConcurrency;
+  }
+  const int needed_ntags =
+      std::max(std::max(FLAGS_read_tag, FLAGS_monitor_tag), FLAGS_blocking_tag) + 1;
   if (FLAGS_task_group_ntags < needed_ntags) {
     LOG(WARNING) << "task_group_ntags(" << FLAGS_task_group_ntags
                  << ") is smaller than required tags(" << needed_ntags
@@ -467,10 +546,16 @@ int main(int argc, char* argv[]) {
   }
 
   brpc::Server read_server;
+  brpc::Server blocking_server;
   brpc::Server monitor_server;
   FileReadServiceImpl svc;
+  BlockingFileReadServiceImpl blocking_svc;
   if (read_server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
     LOG(ERROR) << "Fail to add service";
+    return -1;
+  }
+  if (blocking_server.AddService(&blocking_svc, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
+    LOG(ERROR) << "Fail to add blocking service";
     return -1;
   }
 
@@ -512,7 +597,27 @@ int main(int argc, char* argv[]) {
     return -1;
   }
 
+  brpc::ServerOptions blocking_options;
+  blocking_options.bthread_tag = FLAGS_blocking_tag;
+  blocking_options.has_builtin_services = false;
+  int blocking_threads = FLAGS_blocking_num_threads;
+  const int current_blocking_threads =
+      bthread_getconcurrency_by_tag(static_cast<bthread_tag_t>(FLAGS_blocking_tag));
+  if (current_blocking_threads > blocking_threads) {
+    LOG(WARNING) << "blocking tag " << FLAGS_blocking_tag
+                 << " current concurrency is " << current_blocking_threads
+                 << ", cannot decrease to " << blocking_threads
+                 << ", use " << current_blocking_threads;
+    blocking_threads = current_blocking_threads;
+  }
+  blocking_options.num_threads = blocking_threads;
+  if (blocking_server.Start(FLAGS_blocking_port, &blocking_options) != 0) {
+    LOG(ERROR) << "Fail to start blocking read server";
+    return -1;
+  }
+
   read_server.RunUntilAskedToQuit();
   monitor_server.RunUntilAskedToQuit();
+  blocking_server.RunUntilAskedToQuit();
   return 0;
 }

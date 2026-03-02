@@ -27,3 +27,7 @@ message FileReadResponse {
 service FileReadService {
   rpc Read(FileReadRequest) returns (FileReadResponse);
 }
+
+service BlockingFileReadService {
+  rpc Read(FileReadRequest) returns (FileReadResponse);
+}
