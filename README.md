@@ -83,8 +83,8 @@ curl -s http://127.0.0.1:8041/status | sed -n '1,5p'
 
 Service endpoints (same request/response):
 
-- io_uring service: `/iouring_file_read.FileReadService/Read` (tag 1, port 8040)
-- blocking service: `/iouring_file_read.BlockingFileReadService/Read` (tag 2, port 8042)
+- io_uring service: `/iouring_file_read.FileReadService/Read` (tag 1, port 8040, O_DIRECT)
+- blocking service: `/iouring_file_read.BlockingFileReadService/Read` (tag 2, port 8042, O_DIRECT)
 
 ```bash
 ldd ./build/file_read_server | sed -n '/libbrpc\|liburing\|libprotobuf\|libgflags\|libleveldb\|libsnappy\|libssl\|libcrypto\|libz/p'
@@ -143,7 +143,19 @@ Run:
 ```bash
 ./scripts/brpc_latency_monitor \
   --host=10.192.101.15 \
-  --port=8040 \
+  --service=io_uring \
+  --service_port_map=io_uring:8040,blocking:8042 \
+  --threads=32 \
+  --duration_s=20
+```
+
+Switch to blocking service:
+
+```bash
+./scripts/brpc_latency_monitor \
+  --host=10.192.101.15 \
+  --service=blocking \
+  --service_port_map=io_uring:8040,blocking:8042 \
   --threads=32 \
   --duration_s=20
 ```

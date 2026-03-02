@@ -49,7 +49,7 @@ DEFINE_int32(max_read_len, 1 << 20, "Maximum readable bytes per request");
 DEFINE_int32(read_timeout_ms, 2000, "RPC wait_local timeout in milliseconds");
 DEFINE_int32(direct_io_align, 4096, "Alignment bytes for O_DIRECT reads");
 DEFINE_int32(max_aligned_read_len, 4 << 20,
-             "Maximum aligned bytes submitted to io_uring per request");
+             "Maximum aligned bytes read per request for O_DIRECT paths");
 DEFINE_int32(iouring_batch_cqe_max, 128,
              "Max CQEs to peek in one harvest round");
 DEFINE_bool(iouring_setup_coop_taskrun, true,
@@ -463,23 +463,58 @@ class BlockingFileReadServiceImpl : public iouring_file_read::BlockingFileReadSe
       return SetInvalidArgument(resp, "offset + len overflow");
     }
 
+    const size_t alignment = static_cast<size_t>(FLAGS_direct_io_align);
+    if (!IsPowerOfTwo(alignment) || alignment < 512) {
+      resp->set_code(iouring_file_read::FILE_READ_INTERNAL);
+      resp->set_message("direct_io_align must be power-of-two and >= 512");
+      resp->clear_body();
+      return;
+    }
+
     const std::string path = !req->path().empty() ? req->path() : FLAGS_file_path;
-    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
     if (fd < 0) {
       return SetIoError(resp, errno, "open failed");
     }
 
-    std::string body(static_cast<size_t>(req->len()), '\0');
-    const ssize_t n = pread(fd, &body[0], static_cast<size_t>(req->len()),
-                            static_cast<off_t>(req->offset()));
+    const uint64_t request_offset = static_cast<uint64_t>(req->offset());
+    const uint64_t request_len = static_cast<uint64_t>(req->len());
+    const uint64_t request_end = request_offset + request_len;
+    const uint64_t aligned_offset = AlignDown(request_offset, alignment);
+    const uint64_t aligned_end = AlignUp(request_end, alignment);
+    const uint64_t aligned_len = aligned_end - aligned_offset;
+    if (aligned_len == 0 || aligned_len > static_cast<uint64_t>(FLAGS_max_aligned_read_len)) {
+      close(fd);
+      return SetInvalidArgument(resp, "aligned read length out of range");
+    }
+
+    void* aligned_buffer = nullptr;
+    if (posix_memalign(&aligned_buffer, alignment, static_cast<size_t>(aligned_len)) != 0) {
+      close(fd);
+      return SetIoError(resp, ENOMEM, "allocate aligned buffer failed");
+    }
+    memset(aligned_buffer, 0, static_cast<size_t>(aligned_len));
+
+    const ssize_t n = pread(fd, aligned_buffer, static_cast<size_t>(aligned_len),
+                            static_cast<off_t>(aligned_offset));
     const int saved_errno = errno;
     close(fd);
 
     if (n < 0) {
+      free(aligned_buffer);
       return SetIoError(resp, saved_errno, "pread failed");
     }
 
-    body.resize(static_cast<size_t>(n));
+    std::string body;
+    const size_t prefix_skip = static_cast<size_t>(request_offset - aligned_offset);
+    if (n > static_cast<ssize_t>(prefix_skip)) {
+      const size_t readable_after_skip = static_cast<size_t>(n) - prefix_skip;
+      const size_t body_len = std::min(readable_after_skip, static_cast<size_t>(request_len));
+      const char* body_ptr = static_cast<const char*>(aligned_buffer) + prefix_skip;
+      body.assign(body_ptr, body_len);
+    }
+    free(aligned_buffer);
+
     g_file_read_blocking_ops_total << 1;
     resp->set_code(iouring_file_read::FILE_READ_OK);
     resp->set_message("ok");

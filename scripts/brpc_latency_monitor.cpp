@@ -4,11 +4,13 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
 #include <numeric>
 #include <random>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -20,7 +22,9 @@
 #include "file_read.pb.h"
 
 DEFINE_string(host, "10.192.101.15", "server host");
-DEFINE_int32(port, 8040, "server port");
+DEFINE_string(service, "io_uring", "target service: io_uring or blocking");
+DEFINE_string(service_port_map, "io_uring:8040,blocking:8042",
+              "service->port mapping, format: io_uring:8040,blocking:8042");
 DEFINE_int32(threads, 16, "worker threads");
 DEFINE_int32(duration_s, 60, "test duration in seconds");
 DEFINE_int32(report_interval_s, 1, "report interval in seconds");
@@ -29,6 +33,57 @@ DEFINE_int32(timeout_ms, 5000, "rpc timeout");
 DEFINE_int32(max_retry, 0, "rpc max retry");
 
 namespace {
+
+enum class ServiceKind { kIoUring, kBlocking };
+
+bool ParseServiceKind(const std::string& v, ServiceKind* out) {
+  if (v == "io_uring") {
+    *out = ServiceKind::kIoUring;
+    return true;
+  }
+  if (v == "blocking") {
+    *out = ServiceKind::kBlocking;
+    return true;
+  }
+  return false;
+}
+
+bool ParseServicePortMap(const std::string& text, int* io_port, int* blocking_port) {
+  int parsed_io = -1;
+  int parsed_blocking = -1;
+  std::stringstream ss(text);
+  std::string item;
+  while (std::getline(ss, item, ',')) {
+    const auto pos = item.find(':');
+    if (pos == std::string::npos) {
+      return false;
+    }
+    const std::string key = item.substr(0, pos);
+    const std::string val = item.substr(pos + 1);
+    int port = -1;
+    try {
+      port = std::stoi(val);
+    } catch (const std::exception&) {
+      return false;
+    }
+    if (port <= 0 || port > 65535) {
+      return false;
+    }
+    if (key == "io_uring") {
+      parsed_io = port;
+    } else if (key == "blocking") {
+      parsed_blocking = port;
+    } else {
+      return false;
+    }
+  }
+  if (parsed_io <= 0 || parsed_blocking <= 0) {
+    return false;
+  }
+  *io_port = parsed_io;
+  *blocking_port = parsed_blocking;
+  return true;
+}
 
 struct SharedStats {
   std::mutex mu;
@@ -66,7 +121,7 @@ double Percentile(std::vector<double>& sorted, double q) {
   return sorted[lo] * (1.0 - frac) + sorted[hi] * frac;
 }
 
-void WorkerThread(const std::string& server_addr, SharedStats* stats,
+void WorkerThread(const std::string& server_addr, ServiceKind kind, SharedStats* stats,
                   const std::atomic<bool>* stop) {
   brpc::Channel channel;
   brpc::ChannelOptions options;
@@ -78,6 +133,7 @@ void WorkerThread(const std::string& server_addr, SharedStats* stats,
     return;
   }
   iouring_file_read::FileReadService_Stub stub(&channel);
+  iouring_file_read::BlockingFileReadService_Stub blocking_stub(&channel);
 
   constexpr int32_t kLens[] = {4096, 16384, 32768};
   thread_local std::mt19937_64 rng(
@@ -98,7 +154,11 @@ void WorkerThread(const std::string& server_addr, SharedStats* stats,
     brpc::Controller cntl;
     iouring_file_read::FileReadResponse rsp;
     const auto begin = std::chrono::steady_clock::now();
-    stub.Read(&cntl, &req, &rsp, nullptr);
+    if (kind == ServiceKind::kIoUring) {
+      stub.Read(&cntl, &req, &rsp, nullptr);
+    } else {
+      blocking_stub.Read(&cntl, &req, &rsp, nullptr);
+    }
     const auto end = std::chrono::steady_clock::now();
     const double lat_ms =
         std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(end - begin)
@@ -135,10 +195,10 @@ void WorkerThread(const std::string& server_addr, SharedStats* stats,
 
 void PrintReport(double elapsed_s, uint64_t total, uint64_t ok, uint64_t fail,
                  uint64_t rpc_fail, uint64_t app_fail, std::vector<double> lats_ms,
-                 const std::string& prefix) {
+                 const std::string& prefix, const std::string& service_name) {
   if (lats_ms.empty()) {
     std::cout << prefix << " t=" << std::fixed << std::setprecision(1) << elapsed_s
-              << "s no-samples\n";
+              << "s service=" << service_name << " no-samples\n";
     return;
   }
   std::sort(lats_ms.begin(), lats_ms.end());
@@ -150,8 +210,8 @@ void PrintReport(double elapsed_s, uint64_t total, uint64_t ok, uint64_t fail,
   const double succ = total > 0 ? (100.0 * ok / static_cast<double>(total)) : 0.0;
 
   std::cout << prefix << " t=" << std::fixed << std::setprecision(1) << elapsed_s << "s "
-            << "total=" << total << " ok=" << ok << " fail=" << fail << " (rpc="
-            << rpc_fail << ",app=" << app_fail << ") succ="
+            << "service=" << service_name << " total=" << total << " ok=" << ok
+            << " fail=" << fail << " (rpc=" << rpc_fail << ",app=" << app_fail << ") succ="
             << std::setprecision(2) << succ << "% qps=" << qps << " avg="
             << std::setprecision(3) << avg << "ms p99=" << p99 << "ms p999=" << p999
             << "ms p9999=" << p9999 << "ms\n";
@@ -167,8 +227,23 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  const std::string server_addr = FLAGS_host + ":" + std::to_string(FLAGS_port);
-  std::cout << "target=" << server_addr << " threads=" << FLAGS_threads
+  ServiceKind kind = ServiceKind::kIoUring;
+  if (!ParseServiceKind(FLAGS_service, &kind)) {
+    std::cerr << "invalid --service, expected io_uring|blocking\n";
+    return 1;
+  }
+  int io_port = 0;
+  int blocking_port = 0;
+  if (!ParseServicePortMap(FLAGS_service_port_map, &io_port, &blocking_port)) {
+    std::cerr << "invalid --service_port_map, expected io_uring:PORT,blocking:PORT\n";
+    return 1;
+  }
+  const int target_port = (kind == ServiceKind::kIoUring) ? io_port : blocking_port;
+  const std::string target_service_name =
+      (kind == ServiceKind::kIoUring) ? "io_uring" : "blocking";
+  const std::string mapped_addr = FLAGS_host + ":" + std::to_string(target_port);
+  std::cout << "target=" << mapped_addr << " service=" << target_service_name
+            << " map={" << FLAGS_service_port_map << "} threads=" << FLAGS_threads
             << " duration=" << FLAGS_duration_s
             << "s random_len={4K,16K,32K} file_size_bound=" << FLAGS_file_size_bytes << '\n';
 
@@ -177,7 +252,7 @@ int main(int argc, char** argv) {
   std::vector<std::thread> workers;
   workers.reserve(static_cast<size_t>(FLAGS_threads));
   for (int i = 0; i < FLAGS_threads; ++i) {
-    workers.emplace_back(WorkerThread, server_addr, &stats, &stop);
+    workers.emplace_back(WorkerThread, mapped_addr, kind, &stats, &stop);
   }
 
   const auto begin = std::chrono::steady_clock::now();
@@ -208,7 +283,7 @@ int main(int argc, char** argv) {
       stats.window_app_fail = 0;
     }
     PrintReport(static_cast<double>(FLAGS_report_interval_s), wt, wok, wfail, wrpc_fail,
-                wapp_fail, window, "[window]");
+                wapp_fail, window, "[window]", target_service_name);
 
     if (elapsed_s >= FLAGS_duration_s) {
       break;
@@ -239,6 +314,7 @@ int main(int argc, char** argv) {
     rpc_fail = stats.rpc_fail;
     app_fail = stats.app_fail;
   }
-  PrintReport(total_s, total, ok, fail, rpc_fail, app_fail, std::move(all), "[final ]");
+  PrintReport(total_s, total, ok, fail, rpc_fail, app_fail, std::move(all), "[final ]",
+              target_service_name);
   return 0;
 }
