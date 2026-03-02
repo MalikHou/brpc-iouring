@@ -68,10 +68,46 @@ constexpr uint64_t kReqCtxBufferSizeAlign = 32 * 1024;
 bvar::Adder<int64_t> g_file_read_ops_total("file_read_ops_total");
 bvar::PerSecond<bvar::Adder<int64_t>> g_file_read_iops("file_read_iops",
                                                        &g_file_read_ops_total);
+bvar::LatencyRecorder g_file_read_iouring_total_us("file_read_iouring_total_us");
+bvar::LatencyRecorder g_file_read_iouring_queue_us("file_read_iouring_queue_us");
+bvar::LatencyRecorder g_file_read_iouring_wait_us("file_read_iouring_wait_us");
+bvar::LatencyRecorder g_file_read_iouring_copy_us("file_read_iouring_copy_us");
+bvar::Adder<int64_t> g_iouring_harvest_cqe_total("file_read_iouring_harvest_cqe_total");
+bvar::PerSecond<bvar::Adder<int64_t>> g_iouring_harvest_cqe_qps(
+    "file_read_iouring_harvest_cqe_qps", &g_iouring_harvest_cqe_total);
+bvar::Adder<int64_t> g_iouring_harvest_wake_eagain_total(
+    "file_read_iouring_harvest_wake_eagain_total");
+bvar::PerSecond<bvar::Adder<int64_t>> g_iouring_harvest_wake_eagain_qps(
+    "file_read_iouring_harvest_wake_eagain_qps", &g_iouring_harvest_wake_eagain_total);
+bvar::Adder<int64_t> g_iouring_harvest_wake_error_total(
+    "file_read_iouring_harvest_wake_error_total");
+bvar::PerSecond<bvar::Adder<int64_t>> g_iouring_harvest_wake_error_qps(
+    "file_read_iouring_harvest_wake_error_qps", &g_iouring_harvest_wake_error_total);
 bvar::Adder<int64_t> g_file_read_blocking_ops_total("file_read_blocking_ops_total");
 bvar::PerSecond<bvar::Adder<int64_t>> g_file_read_blocking_iops(
     "file_read_blocking_iops", &g_file_read_blocking_ops_total);
+bvar::LatencyRecorder g_file_read_blocking_total_us("file_read_blocking_total_us");
+bvar::LatencyRecorder g_file_read_blocking_pread_us("file_read_blocking_pread_us");
 int g_shared_direct_fd = -1;
+
+inline int64_t MonoNowNs() {
+  timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
+}
+
+struct ScopedLatencyUs {
+  explicit ScopedLatencyUs(bvar::LatencyRecorder* rec) : rec_(rec), begin_ns_(MonoNowNs()) {}
+  ~ScopedLatencyUs() {
+    if (rec_ != nullptr) {
+      (*rec_) << ((MonoNowNs() - begin_ns_) / 1000);
+    }
+  }
+
+ private:
+  bvar::LatencyRecorder* rec_ = nullptr;
+  int64_t begin_ns_ = 0;
+};
 
 struct ReqCtx {
   ReqCtx() : done_butex(bthread::butex_create()) {
@@ -261,6 +297,7 @@ class WorkerIoState {
       if (n == 0) {
         break;
       }
+      g_iouring_harvest_cqe_total << n;
       unsigned advanced = 0;
       bool blocked_on_wake_eagain = false;
       for (unsigned i = 0; i < n; ++i) {
@@ -282,10 +319,12 @@ class WorkerIoState {
               made_progress = true;
             }
           } else if (wake_rc == -1 && errno == EAGAIN) {
+            g_iouring_harvest_wake_eagain_total << 1;
             // pin_rq is temporarily full: keep this CQE for next harvest.
             blocked_on_wake_eagain = true;
             break;
           } else {
+            g_iouring_harvest_wake_error_total << 1;
             req->wake_errno = errno;
           }
         }
@@ -364,6 +403,7 @@ class FileReadServiceImpl : public iouring_file_read::FileReadService {
             iouring_file_read::FileReadResponse* resp,
             ::google::protobuf::Closure* done) override {
     brpc::ClosureGuard done_guard(done);
+    ScopedLatencyUs total_lat(&g_file_read_iouring_total_us);
 
     if (req->offset() < 0) {
       return SetInvalidArgument(resp, "offset must be non-negative");
@@ -433,8 +473,10 @@ class FileReadServiceImpl : public iouring_file_read::FileReadService {
     if (prep_rc != 0) {
       return SetIoError(resp, prep_rc, "allocate aligned buffer failed");
     }
+    const int64_t queue_begin_ns = MonoNowNs();
     const int submit_rc =
         g_worker_io->QueueRead(fd, request_ctx, static_cast<off_t>(aligned_offset));
+    g_file_read_iouring_queue_us << ((MonoNowNs() - queue_begin_ns) / 1000);
     if (submit_rc != 0) {
       return SetIoError(resp, submit_rc, "io_uring submit read failed");
     }
@@ -450,7 +492,9 @@ class FileReadServiceImpl : public iouring_file_read::FileReadService {
       ts.tv_nsec -= 1000000000LL;
     }
 
+    const int64_t wait_begin_ns = MonoNowNs();
     const int wait_rc = bthread_butex_wait_local(request_ctx->done_butex, 0, &ts);
+    g_file_read_iouring_wait_us << ((MonoNowNs() - wait_begin_ns) / 1000);
     const int butex_value =
         static_cast<butil::atomic<int>*>(request_ctx->done_butex)
             ->load(butil::memory_order_acquire);
@@ -476,6 +520,7 @@ class FileReadServiceImpl : public iouring_file_read::FileReadService {
 
     g_file_read_ops_total << 1;
     resp->set_code(iouring_file_read::FILE_READ_OK);
+    const int64_t copy_begin_ns = MonoNowNs();
     if (request_ctx->io_result <= static_cast<ssize_t>(request_ctx->prefix_skip)) {
       resp->clear_body();
     } else {
@@ -486,6 +531,7 @@ class FileReadServiceImpl : public iouring_file_read::FileReadService {
           static_cast<const char*>(request_ctx->aligned_buffer) + request_ctx->prefix_skip;
       resp->set_body(body_ptr, body_len);
     }
+    g_file_read_iouring_copy_us << ((MonoNowNs() - copy_begin_ns) / 1000);
     resp->set_message("ok");
     (void)cntl_base;
   }
@@ -513,6 +559,7 @@ class BlockingFileReadServiceImpl : public iouring_file_read::BlockingFileReadSe
             iouring_file_read::FileReadResponse* resp,
             ::google::protobuf::Closure* done) override {
     brpc::ClosureGuard done_guard(done);
+    ScopedLatencyUs total_lat(&g_file_read_blocking_total_us);
 
     if (req->offset() < 0) {
       return SetInvalidArgument(resp, "offset must be non-negative");
@@ -560,8 +607,10 @@ class BlockingFileReadServiceImpl : public iouring_file_read::BlockingFileReadSe
     }
     memset(aligned_buffer, 0, static_cast<size_t>(aligned_len));
 
+    const int64_t pread_begin_ns = MonoNowNs();
     const ssize_t n = pread(fd, aligned_buffer, static_cast<size_t>(aligned_len),
                             static_cast<off_t>(aligned_offset));
+    g_file_read_blocking_pread_us << ((MonoNowNs() - pread_begin_ns) / 1000);
     const int saved_errno = errno;
 
     if (n < 0) {
