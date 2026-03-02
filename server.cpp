@@ -48,7 +48,7 @@ DEFINE_string(file_path, "/tmp/iouring-read-default.txt",
               "Default file path when request.path is empty");
 DEFINE_int32(max_read_len, 1 << 20, "Maximum readable bytes per request");
 DEFINE_int32(read_len_bytes, 32 * 1024,
-             "Required request len in bytes; must be multiple of 32KiB");
+             "Required request len in bytes");
 DEFINE_int32(read_timeout_ms, 2000, "RPC wait_local timeout in milliseconds");
 DEFINE_int32(direct_io_align, 4096, "Alignment bytes for O_DIRECT reads");
 DEFINE_int32(max_aligned_read_len, 4 << 20,
@@ -606,10 +606,8 @@ class BlockingFileReadServiceImpl : public iouring_file_read::BlockingFileReadSe
 
 int main(int argc, char* argv[]) {
   google::ParseCommandLineFlags(&argc, &argv, true);
-  if (FLAGS_read_len_bytes <= 0 ||
-      (FLAGS_read_len_bytes % static_cast<int32_t>(kReqCtxBufferSizeAlign)) != 0) {
-    LOG(ERROR) << "read_len_bytes must be positive and multiple of "
-               << kReqCtxBufferSizeAlign;
+  if (FLAGS_read_len_bytes <= 0) {
+    LOG(ERROR) << "read_len_bytes must be positive";
     return 1;
   }
   if (FLAGS_read_len_bytes > FLAGS_max_read_len) {

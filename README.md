@@ -166,7 +166,7 @@ Switch to blocking service:
 Client behavior:
 
 - server requires `req.len == --read_len_bytes` (default `32768`), otherwise returns invalid argument
-- `--read_len_bytes` must be a multiple of `32KiB` (ReqCtx pool buffer capacity grows by `--read_len_bytes`)
+- ReqCtx pool buffer capacity grows by `--read_len_bytes`
 - client should use matching `--len_bytes` (default `32768`)
 - random `offset` aligned to 4K
 - bounded by `--file_size_bytes` (default `4GiB`) so reads never exceed the 4GiB range
