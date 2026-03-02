@@ -69,6 +69,7 @@ bvar::PerSecond<bvar::Adder<int64_t>> g_file_read_iops("file_read_iops",
 bvar::Adder<int64_t> g_file_read_blocking_ops_total("file_read_blocking_ops_total");
 bvar::PerSecond<bvar::Adder<int64_t>> g_file_read_blocking_iops(
     "file_read_blocking_iops", &g_file_read_blocking_ops_total);
+int g_shared_direct_fd = -1;
 
 struct ReqCtx {
   ReqCtx() : done_butex(bthread::butex_create()) {
@@ -326,11 +327,16 @@ class FileReadServiceImpl : public iouring_file_read::FileReadService {
       return;
     }
 
-    const std::string path = !req->path().empty() ? req->path() : FLAGS_file_path;
-    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
-    if (fd < 0) {
-      return SetIoError(resp, errno, "open failed");
+    if (!req->path().empty() && req->path() != FLAGS_file_path) {
+      return SetInvalidArgument(resp, "request.path override is disabled");
     }
+    if (g_shared_direct_fd < 0) {
+      resp->set_code(iouring_file_read::FILE_READ_INTERNAL);
+      resp->set_message("shared direct fd unavailable");
+      resp->clear_body();
+      return;
+    }
+    const int fd = g_shared_direct_fd;
 
     const uint64_t request_offset = static_cast<uint64_t>(req->offset());
     const uint64_t request_len = static_cast<uint64_t>(req->len());
@@ -339,13 +345,11 @@ class FileReadServiceImpl : public iouring_file_read::FileReadService {
     const uint64_t aligned_end = AlignUp(request_end, alignment);
     const uint64_t aligned_len = aligned_end - aligned_offset;
     if (aligned_len == 0 || aligned_len > static_cast<uint64_t>(FLAGS_max_aligned_read_len)) {
-      close(fd);
       return SetInvalidArgument(resp, "aligned read length out of range");
     }
 
     ReqCtx request_ctx;
     if (request_ctx.done_butex == nullptr) {
-      close(fd);
       resp->set_code(iouring_file_read::FILE_READ_INTERNAL);
       resp->set_message("failed to create private butex");
       return;
@@ -355,11 +359,9 @@ class FileReadServiceImpl : public iouring_file_read::FileReadService {
     const int prep_rc =
         request_ctx.PrepareAlignedBuffer(alignment, static_cast<size_t>(aligned_len));
     if (prep_rc != 0) {
-      close(fd);
       return SetIoError(resp, prep_rc, "allocate aligned buffer failed");
     }
     if (!g_worker_io) {
-      close(fd);
       resp->set_code(iouring_file_read::FILE_READ_INTERNAL);
       resp->set_message("worker io state unavailable");
       return;
@@ -367,7 +369,6 @@ class FileReadServiceImpl : public iouring_file_read::FileReadService {
     const int submit_rc =
         g_worker_io->QueueRead(fd, &request_ctx, static_cast<off_t>(aligned_offset));
     if (submit_rc != 0) {
-      close(fd);
       return SetIoError(resp, submit_rc, "io_uring submit read failed");
     }
 
@@ -388,7 +389,6 @@ class FileReadServiceImpl : public iouring_file_read::FileReadService {
             ->load(butil::memory_order_acquire);
     if (wait_rc != 0 && errno != EWOULDBLOCK && butex_value == 0) {
       const int saved_errno = errno;
-      close(fd);
       if (saved_errno == ETIMEDOUT) {
         resp->set_code(iouring_file_read::FILE_READ_TIMEOUT);
         resp->set_message("wait_local timeout");
@@ -397,8 +397,6 @@ class FileReadServiceImpl : public iouring_file_read::FileReadService {
       }
       return;
     }
-
-    close(fd);
 
     if (request_ctx.wake_errno != 0) {
       SetIoError(resp, request_ctx.wake_errno, "wake_within failed");
@@ -471,11 +469,16 @@ class BlockingFileReadServiceImpl : public iouring_file_read::BlockingFileReadSe
       return;
     }
 
-    const std::string path = !req->path().empty() ? req->path() : FLAGS_file_path;
-    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
-    if (fd < 0) {
-      return SetIoError(resp, errno, "open failed");
+    if (!req->path().empty() && req->path() != FLAGS_file_path) {
+      return SetInvalidArgument(resp, "request.path override is disabled");
     }
+    if (g_shared_direct_fd < 0) {
+      resp->set_code(iouring_file_read::FILE_READ_INTERNAL);
+      resp->set_message("shared direct fd unavailable");
+      resp->clear_body();
+      return;
+    }
+    const int fd = g_shared_direct_fd;
 
     const uint64_t request_offset = static_cast<uint64_t>(req->offset());
     const uint64_t request_len = static_cast<uint64_t>(req->len());
@@ -484,13 +487,11 @@ class BlockingFileReadServiceImpl : public iouring_file_read::BlockingFileReadSe
     const uint64_t aligned_end = AlignUp(request_end, alignment);
     const uint64_t aligned_len = aligned_end - aligned_offset;
     if (aligned_len == 0 || aligned_len > static_cast<uint64_t>(FLAGS_max_aligned_read_len)) {
-      close(fd);
       return SetInvalidArgument(resp, "aligned read length out of range");
     }
 
     void* aligned_buffer = nullptr;
     if (posix_memalign(&aligned_buffer, alignment, static_cast<size_t>(aligned_len)) != 0) {
-      close(fd);
       return SetIoError(resp, ENOMEM, "allocate aligned buffer failed");
     }
     memset(aligned_buffer, 0, static_cast<size_t>(aligned_len));
@@ -498,7 +499,6 @@ class BlockingFileReadServiceImpl : public iouring_file_read::BlockingFileReadSe
     const ssize_t n = pread(fd, aligned_buffer, static_cast<size_t>(aligned_len),
                             static_cast<off_t>(aligned_offset));
     const int saved_errno = errno;
-    close(fd);
 
     if (n < 0) {
       free(aligned_buffer);
@@ -542,6 +542,12 @@ class BlockingFileReadServiceImpl : public iouring_file_read::BlockingFileReadSe
 
 int main(int argc, char* argv[]) {
   google::ParseCommandLineFlags(&argc, &argv, true);
+  g_shared_direct_fd = open(FLAGS_file_path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+  if (g_shared_direct_fd < 0) {
+    LOG(ERROR) << "Fail to open file_path with O_DIRECT: " << FLAGS_file_path
+               << ", errno=" << errno << " (" << strerror(errno) << ")";
+    return 1;
+  }
   constexpr int kMinTagConcurrency = 4;
   if (FLAGS_read_num_threads < kMinTagConcurrency) {
     LOG(WARNING) << "read_num_threads(" << FLAGS_read_num_threads
@@ -654,5 +660,7 @@ int main(int argc, char* argv[]) {
   read_server.RunUntilAskedToQuit();
   monitor_server.RunUntilAskedToQuit();
   blocking_server.RunUntilAskedToQuit();
+  close(g_shared_direct_fd);
+  g_shared_direct_fd = -1;
   return 0;
 }
