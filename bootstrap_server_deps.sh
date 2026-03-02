@@ -3,8 +3,8 @@ set -eu
 
 # Bootstrap dependencies for standalone server build.
 # This script is intended to be run from any location.
-# It installs system packages, builds liburing, builds brpc active-task branch,
-# then builds this server with the root CMakeLists.txt.
+# It installs system packages, builds liburing, and builds brpc active-task branch.
+# It does not build this repository's server binary.
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 ROOT_DIR="${SCRIPT_DIR}"
@@ -19,7 +19,6 @@ GFLAGS_DIR="${THIRD_PARTY_SRC_DIR}/gflags"
 PROTOBUF_DIR="${THIRD_PARTY_SRC_DIR}/protobuf"
 SNAPPY_DIR="${THIRD_PARTY_SRC_DIR}/snappy"
 LEVELDB_DIR="${THIRD_PARTY_SRC_DIR}/leveldb"
-SERVER_BUILD_DIR="${SCRIPT_DIR}/build"
 BRPC_BRANCH="${BRPC_BRANCH:-malikhou/add_active_task}"
 BRPC_REPO="${BRPC_REPO:-https://github.com/MalikHou/brpc.git}"
 ZLIB_VERSION="${ZLIB_VERSION:-1.3.1}"
@@ -117,12 +116,6 @@ check_local_dep() {
     echo "[error] missing library: ${LOCAL_LIB}/${LIB_PATH}" >&2
     exit 1
   fi
-}
-
-print_linkage_summary() {
-  BIN="$1"
-  echo "[verify] Runtime linkage (critical deps):"
-  ldd "${BIN}" | sed -n '/libbrpc\|liburing\|libprotobuf\|libgflags\|libleveldb\|libsnappy\|libssl\|libcrypto\|libz/p'
 }
 
 echo "[info] kernel: $(uname -r)"
@@ -255,7 +248,7 @@ echo "[step] Validate local third-party prerequisites"
 check_local_dep "zlib.h" "libz.so"
 check_local_dep "openssl/ssl.h" "libssl.so"
 check_local_dep "gflags/gflags.h" "libgflags.so"
-check_local_dep "google/protobuf/message.h" "libprotobuf.so"
+check_local_dep "google/protobuf/service.h" "libprotobuf.so"
 check_local_dep "snappy.h" "libsnappy.so"
 check_local_dep "leveldb/db.h" "libleveldb.so"
 check_local_dep "liburing.h" "liburing.so"
@@ -283,19 +276,7 @@ fi
   make -j"${JOBS}"
 )
 
-echo "[step] Build server"
-cmake -S "${SCRIPT_DIR}" -B "${SERVER_BUILD_DIR}" \
-  -DBRPC_ROOT="${BRPC_DIR}/output" \
-  -DTHIRD_PARTY_ROOT="${THIRD_PARTY_INSTALL_DIR}"
-cmake --build "${SERVER_BUILD_DIR}" -j"${JOBS}"
-ln -sfn "build/compile_commands.json" "${SCRIPT_DIR}/compile_commands.json"
-
-echo "[verify] CMake resolved paths:"
-sed -n '/BRPC_INCLUDE_DIR\|BRPC_LIBRARY\|LIBURING_INCLUDE_DIR\|LIBURING_LIBRARY\|PROTOBUF_INCLUDE_DIR\|PROTOBUF_LIBRARY\|GFLAGS_INCLUDE_DIR\|GFLAGS_LIBRARY/p' \
-  "${SERVER_BUILD_DIR}/CMakeCache.txt"
-print_linkage_summary "${SERVER_BUILD_DIR}/file_read_server"
-
-echo "[done] server ready:"
-echo "       ${SERVER_BUILD_DIR}/file_read_server"
-echo "[done] third-party install:"
+echo "[done] dependencies ready:"
 echo "       ${THIRD_PARTY_INSTALL_DIR}"
+echo "[done] brpc ready:"
+echo "       ${BRPC_DIR}/output"

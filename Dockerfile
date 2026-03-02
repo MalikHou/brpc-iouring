@@ -22,6 +22,10 @@ COPY . /workspace
 
 # Full dependency bootstrap + server build.
 RUN ./bootstrap_server_deps.sh
+RUN cmake -S . -B build \
+    -DBRPC_ROOT="/workspace/third_party/src/brpc/output" \
+    -DTHIRD_PARTY_ROOT="/workspace/third_party/install" \
+ && cmake --build build -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
 
 EXPOSE 8040 8041
 

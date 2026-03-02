@@ -40,7 +40,9 @@ if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
       "brpc headers/library not found. Set -DBRPC_ROOT=/path/to/brpc/install")
   endif()
 
-  find_path(PROTOBUF_INCLUDE_DIR google/protobuf/message.h
+  # brpc headers include google/protobuf/service.h directly.
+  # Probe with service.h (not just message.h) to catch mismatched protobuf installs.
+  find_path(PROTOBUF_INCLUDE_DIR google/protobuf/service.h
     HINTS ${THIRD_PARTY_ROOT}
     PATH_SUFFIXES include
     NO_DEFAULT_PATH
@@ -127,6 +129,12 @@ target_include_directories(file_read_server
     ${PROTOBUF_INCLUDE_DIR}
     ${BRPC_INCLUDE_DIR}
     ${LIBURING_INCLUDE_DIR}
+)
+# Force explicit include path emission even when environment (e.g. CPATH)
+# makes CMake treat paths as implicit and omit -I.
+target_compile_options(file_read_server PRIVATE
+  "-I${PROTOBUF_INCLUDE_DIR}"
+  "-I${BRPC_INCLUDE_DIR}"
 )
 target_link_libraries(file_read_server
   PRIVATE
