@@ -1,0 +1,33 @@
+# CMake / build outputs
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+Testing/
+
+# Third-party dependencies and install artifacts
+third_party/
+
+# IDE / language server caches
+.cache/
+
+# Generic C/C++ build artifacts
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+*.obj
+*.lib
+*.pdb
+
+# Logs and core dumps
+*.log
+core
+core.*
