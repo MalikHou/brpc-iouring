@@ -286,8 +286,7 @@ fi
 echo "[step] Build server"
 cmake -S "${SCRIPT_DIR}" -B "${SERVER_BUILD_DIR}" \
   -DBRPC_ROOT="${BRPC_DIR}/output" \
-  -DTHIRD_PARTY_ROOT="${THIRD_PARTY_INSTALL_DIR}" \
-  -DCMAKE_PREFIX_PATH="${THIRD_PARTY_INSTALL_DIR}"
+  -DTHIRD_PARTY_ROOT="${THIRD_PARTY_INSTALL_DIR}"
 cmake --build "${SERVER_BUILD_DIR}" -j"${JOBS}"
 ln -sfn "build/compile_commands.json" "${SCRIPT_DIR}/compile_commands.json"
 
