@@ -109,6 +109,30 @@ docker run --rm -it \
   brpc-iouring:latest
 ```
 
+## C++ client benchmark
+
+Compile:
+
+```bash
+c++ -O2 -std=c++17 scripts/brpc_latency_monitor.cpp build/file_read.pb.cc \
+  -Ibuild -Ithird_party/install/include -Ithird_party/src/brpc/output/include \
+  -Lthird_party/src/brpc/output/lib -Lthird_party/install/lib \
+  -Wl,-rpath,'$ORIGIN/../third_party/src/brpc/output/lib:$ORIGIN/../third_party/install/lib' \
+  -lbrpc -lprotobuf -lgflags -lleveldb -lsnappy -lssl -lcrypto -lz -luring -ldl -lrt -pthread \
+  -o scripts/brpc_latency_monitor
+```
+
+Run:
+
+```bash
+./scripts/brpc_latency_monitor \
+  --host=10.192.101.15 \
+  --port=8040 \
+  --threads=32 \
+  --duration_s=20 \
+  --length=4096
+```
+
 ## Optional bootstrap overrides
 
 ```bash

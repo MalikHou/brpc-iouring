@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include <bvar/bvar.h>
 #include <bthread/butex.h>
 #include <bthread/bthread.h>
 #include <bthread/unstable.h>
@@ -51,14 +52,16 @@ DEFINE_bool(iouring_setup_coop_taskrun, true,
             "Enable IORING_SETUP_COOP_TASKRUN when supported");
 DEFINE_bool(iouring_setup_single_issuer, true,
             "Enable IORING_SETUP_SINGLE_ISSUER when supported");
-DEFINE_bool(iouring_setup_defer_taskrun, true,
-            "Enable IORING_SETUP_DEFER_TASKRUN when supported");
 DEFINE_bool(iouring_setup_sqpoll, false,
             "Enable IORING_SETUP_SQPOLL when supported");
 DEFINE_int32(iouring_sq_thread_idle_ms, 2000,
              "sq_thread_idle for IORING_SETUP_SQPOLL");
 
 namespace {
+
+bvar::Adder<int64_t> g_file_read_ops_total("file_read_ops_total");
+bvar::PerSecond<bvar::Adder<int64_t>> g_file_read_iops("file_read_iops",
+                                                       &g_file_read_ops_total);
 
 struct ReqCtx {
   ReqCtx() : done_butex(bthread::butex_create()) {
@@ -122,11 +125,6 @@ class WorkerIoState {
 #ifdef IORING_SETUP_SINGLE_ISSUER
     if (FLAGS_iouring_setup_single_issuer) {
       p.flags |= IORING_SETUP_SINGLE_ISSUER;
-    }
-#endif
-#ifdef IORING_SETUP_DEFER_TASKRUN
-    if (FLAGS_iouring_setup_defer_taskrun) {
-      p.flags |= IORING_SETUP_DEFER_TASKRUN;
     }
 #endif
 #ifdef IORING_SETUP_SQPOLL
@@ -404,6 +402,7 @@ class FileReadServiceImpl : public iouring_file_read::FileReadService {
       return;
     }
 
+    g_file_read_ops_total << 1;
     resp->set_code(iouring_file_read::FILE_READ_OK);
     if (request_ctx.io_result <= static_cast<ssize_t>(request_ctx.prefix_skip)) {
       resp->clear_body();
