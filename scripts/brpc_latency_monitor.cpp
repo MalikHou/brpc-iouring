@@ -29,6 +29,7 @@ DEFINE_int32(threads, 16, "worker threads");
 DEFINE_int32(duration_s, 60, "test duration in seconds");
 DEFINE_int32(report_interval_s, 1, "report interval in seconds");
 DEFINE_int64(file_size_bytes, 4LL << 30, "logical file size bound for random reads");
+DEFINE_int32(len_bytes, 32 * 1024, "request len in bytes");
 DEFINE_int32(timeout_ms, 5000, "rpc timeout");
 DEFINE_int32(max_retry, 0, "rpc max retry");
 
@@ -135,21 +136,18 @@ void WorkerThread(const std::string& server_addr, ServiceKind kind, SharedStats*
   iouring_file_read::FileReadService_Stub stub(&channel);
   iouring_file_read::BlockingFileReadService_Stub blocking_stub(&channel);
 
-  constexpr int32_t kLens[] = {4096, 16384, 32768};
   thread_local std::mt19937_64 rng(
       static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()) ^
       static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&rng)));
-  std::uniform_int_distribution<int> len_dist(0, 2);
 
   iouring_file_read::FileReadRequest req;
   while (!stop->load(std::memory_order_relaxed)) {
-    const int32_t len = kLens[len_dist(rng)];
-    const int64_t max_off = std::max<int64_t>(0, FLAGS_file_size_bytes - len);
+    const int64_t max_off = std::max<int64_t>(0, FLAGS_file_size_bytes - FLAGS_len_bytes);
     const int64_t max_slot = max_off / 4096;
     std::uniform_int_distribution<int64_t> off_dist(0, max_slot);
     const int64_t off = off_dist(rng) * 4096;
     req.set_offset(off);
-    req.set_len(len);
+    req.set_len(FLAGS_len_bytes);
 
     brpc::Controller cntl;
     iouring_file_read::FileReadResponse rsp;
@@ -222,7 +220,7 @@ void PrintReport(double elapsed_s, uint64_t total, uint64_t ok, uint64_t fail,
 int main(int argc, char** argv) {
   google::ParseCommandLineFlags(&argc, &argv, true);
   if (FLAGS_threads <= 0 || FLAGS_duration_s <= 0 || FLAGS_report_interval_s <= 0 ||
-      FLAGS_file_size_bytes < 32768) {
+      FLAGS_len_bytes <= 0 || FLAGS_file_size_bytes < FLAGS_len_bytes) {
     std::cerr << "invalid arguments\n";
     return 1;
   }
@@ -245,7 +243,8 @@ int main(int argc, char** argv) {
   std::cout << "target=" << mapped_addr << " service=" << target_service_name
             << " map={" << FLAGS_service_port_map << "} threads=" << FLAGS_threads
             << " duration=" << FLAGS_duration_s
-            << "s random_len={4K,16K,32K} file_size_bound=" << FLAGS_file_size_bytes << '\n';
+            << "s len=" << FLAGS_len_bytes
+            << " file_size_bound=" << FLAGS_file_size_bytes << '\n';
 
   SharedStats stats;
   std::atomic<bool> stop{false};

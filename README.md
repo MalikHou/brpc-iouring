@@ -72,6 +72,7 @@ Run:
   --read_num_threads=12 \
   --blocking_num_threads=12 \
   --monitor_num_threads=4 \
+  --read_len_bytes=32768 \
   --file_path=/tmp/iouring-directio.bin
 ```
 
@@ -145,6 +146,7 @@ Run:
   --host=10.192.101.15 \
   --service=io_uring \
   --service_port_map=io_uring:8040,blocking:8042 \
+  --len_bytes=32768 \
   --threads=32 \
   --duration_s=20
 ```
@@ -156,13 +158,16 @@ Switch to blocking service:
   --host=10.192.101.15 \
   --service=blocking \
   --service_port_map=io_uring:8040,blocking:8042 \
+  --len_bytes=32768 \
   --threads=32 \
   --duration_s=20
 ```
 
 Client behavior:
 
-- random `len` in `{4K, 16K, 32K}`
+- server requires `req.len == --read_len_bytes` (default `32768`), otherwise returns invalid argument
+- `--read_len_bytes` must be a multiple of `32KiB` (ReqCtx pool buffer capacity grows by `--read_len_bytes`)
+- client should use matching `--len_bytes` (default `32768`)
 - random `offset` aligned to 4K
 - bounded by `--file_size_bytes` (default `4GiB`) so reads never exceed the 4GiB range
 

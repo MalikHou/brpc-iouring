@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -46,6 +47,8 @@ DEFINE_int32(monitor_num_threads, 4,
 DEFINE_string(file_path, "/tmp/iouring-read-default.txt",
               "Default file path when request.path is empty");
 DEFINE_int32(max_read_len, 1 << 20, "Maximum readable bytes per request");
+DEFINE_int32(read_len_bytes, 32 * 1024,
+             "Required request len in bytes; must be multiple of 32KiB");
 DEFINE_int32(read_timeout_ms, 2000, "RPC wait_local timeout in milliseconds");
 DEFINE_int32(direct_io_align, 4096, "Alignment bytes for O_DIRECT reads");
 DEFINE_int32(max_aligned_read_len, 4 << 20,
@@ -56,12 +59,11 @@ DEFINE_bool(iouring_setup_coop_taskrun, true,
             "Enable IORING_SETUP_COOP_TASKRUN when supported");
 DEFINE_bool(iouring_setup_single_issuer, true,
             "Enable IORING_SETUP_SINGLE_ISSUER when supported");
-DEFINE_bool(iouring_setup_sqpoll, false,
-            "Enable IORING_SETUP_SQPOLL when supported");
-DEFINE_int32(iouring_sq_thread_idle_ms, 2000,
-             "sq_thread_idle for IORING_SETUP_SQPOLL");
 
 namespace {
+
+constexpr unsigned kRingQueueDepth = 512;
+constexpr uint64_t kReqCtxBufferSizeAlign = 32 * 1024;
 
 bvar::Adder<int64_t> g_file_read_ops_total("file_read_ops_total");
 bvar::PerSecond<bvar::Adder<int64_t>> g_file_read_iops("file_read_iops",
@@ -89,27 +91,58 @@ struct ReqCtx {
     }
   }
 
-  int PrepareAlignedBuffer(size_t alignment, size_t length) {
-    aligned_len = length;
-    if (aligned_len == 0) {
+  ReqCtx(const ReqCtx&) = delete;
+  ReqCtx& operator=(const ReqCtx&) = delete;
+  ReqCtx(ReqCtx&&) = delete;
+  ReqCtx& operator=(ReqCtx&&) = delete;
+
+  int EnsureAlignedBuffer(size_t alignment, size_t length) {
+    if (length == 0) {
       return EINVAL;
     }
-    if (posix_memalign(&aligned_buffer, alignment, aligned_len) != 0) {
-      aligned_buffer = nullptr;
-      return ENOMEM;
+    const size_t growth_unit =
+        FLAGS_read_len_bytes > 0 ? static_cast<size_t>(FLAGS_read_len_bytes) : size_t{1};
+    const size_t required_capacity =
+        ((length + growth_unit - 1) / growth_unit) * growth_unit;
+    if (aligned_buffer == nullptr || buffer_capacity < required_capacity) {
+      if (aligned_buffer != nullptr) {
+        free(aligned_buffer);
+        aligned_buffer = nullptr;
+      }
+      if (posix_memalign(&aligned_buffer, alignment, required_capacity) != 0) {
+        aligned_buffer = nullptr;
+        aligned_len = 0;
+        buffer_capacity = 0;
+        return ENOMEM;
+      }
+      buffer_capacity = required_capacity;
     }
-    memset(aligned_buffer, 0, aligned_len);
+    aligned_len = length;
     return 0;
+  }
+
+  void ResetForNewRequest() {
+    request_len = 0;
+    prefix_skip = 0;
+    io_result = 0;
+    io_errno = 0;
+    wake_errno = 0;
+    if (done_butex != nullptr) {
+      static_cast<butil::atomic<int>*>(done_butex)->store(0,
+                                                          butil::memory_order_release);
+    }
   }
 
   void* done_butex = nullptr;
   void* aligned_buffer = nullptr;
   size_t aligned_len = 0;
+  size_t buffer_capacity = 0;
   size_t prefix_skip = 0;
   size_t request_len = 0;
   ssize_t io_result = 0;
   int io_errno = 0;
   int wake_errno = 0;
+  ReqCtx* next_free = nullptr;
 };
 
 class WorkerIoState {
@@ -122,7 +155,6 @@ class WorkerIoState {
     if (initialized_) {
       return 0;
     }
-    constexpr unsigned kQueueDepth = 512;
     io_uring_params p;
     memset(&p, 0, sizeof(p));
 #ifdef IORING_SETUP_COOP_TASKRUN
@@ -135,19 +167,24 @@ class WorkerIoState {
       p.flags |= IORING_SETUP_SINGLE_ISSUER;
     }
 #endif
-#ifdef IORING_SETUP_SQPOLL
-    if (FLAGS_iouring_setup_sqpoll) {
-      p.flags |= IORING_SETUP_SQPOLL;
-      p.sq_thread_idle = FLAGS_iouring_sq_thread_idle_ms;
-    }
-#endif
-    int rc = io_uring_queue_init_params(kQueueDepth, &ring_, &p);
+    int rc = io_uring_queue_init_params(kRingQueueDepth, &ring_, &p);
     if (rc < 0) {
       // Fall back to baseline setup when tuned flags are not available in the runtime.
-      rc = io_uring_queue_init(kQueueDepth, &ring_, 0);
+      rc = io_uring_queue_init(kRingQueueDepth, &ring_, 0);
       if (rc < 0) {
         return -rc;
       }
+    }
+    req_ctx_pool_.reserve(kRingQueueDepth);
+    free_head_ = nullptr;
+    for (unsigned i = 0; i < kRingQueueDepth; ++i) {
+      req_ctx_pool_.emplace_back(new ReqCtx());
+      ReqCtx* ctx = req_ctx_pool_.back().get();
+      if (ctx->done_butex == nullptr) {
+        return ENOMEM;
+      }
+      ctx->next_free = free_head_;
+      free_head_ = ctx;
     }
     initialized_ = true;
     return 0;
@@ -157,8 +194,29 @@ class WorkerIoState {
     if (!initialized_) {
       return;
     }
+    free_head_ = nullptr;
+    req_ctx_pool_.clear();
     io_uring_queue_exit(&ring_);
     initialized_ = false;
+  }
+
+  ReqCtx* AcquireReqCtx() {
+    if (free_head_ == nullptr) {
+      return nullptr;
+    }
+    ReqCtx* ctx = free_head_;
+    free_head_ = ctx->next_free;
+    ctx->next_free = nullptr;
+    ctx->ResetForNewRequest();
+    return ctx;
+  }
+
+  void ReleaseReqCtx(ReqCtx* req) {
+    if (req == nullptr) {
+      return;
+    }
+    req->next_free = free_head_;
+    free_head_ = req;
   }
 
   int QueueRead(int fd, ReqCtx* req, off_t offset) {
@@ -247,6 +305,8 @@ class WorkerIoState {
  private:
   io_uring ring_;
   bool initialized_;
+  std::vector<std::unique_ptr<ReqCtx>> req_ctx_pool_;
+  ReqCtx* free_head_ = nullptr;
 };
 
 thread_local WorkerIoState* g_worker_io = nullptr;
@@ -308,14 +368,11 @@ class FileReadServiceImpl : public iouring_file_read::FileReadService {
     if (req->offset() < 0) {
       return SetInvalidArgument(resp, "offset must be non-negative");
     }
-    if (req->len() <= 0) {
-      return SetInvalidArgument(resp, "len must be positive");
-    }
-    if (req->len() > FLAGS_max_read_len) {
-      return SetInvalidArgument(resp, "len exceeds max_read_len");
+    if (req->len() != FLAGS_read_len_bytes) {
+      return SetInvalidArgument(resp, "len must equal server --read_len_bytes");
     }
     if (req->offset() >
-        (std::numeric_limits<int64_t>::max() - static_cast<int64_t>(req->len()))) {
+        (std::numeric_limits<int64_t>::max() - static_cast<int64_t>(FLAGS_read_len_bytes))) {
       return SetInvalidArgument(resp, "offset + len overflow");
     }
 
@@ -339,7 +396,7 @@ class FileReadServiceImpl : public iouring_file_read::FileReadService {
     const int fd = g_shared_direct_fd;
 
     const uint64_t request_offset = static_cast<uint64_t>(req->offset());
-    const uint64_t request_len = static_cast<uint64_t>(req->len());
+    const uint64_t request_len = static_cast<uint64_t>(FLAGS_read_len_bytes);
     const uint64_t request_end = request_offset + request_len;
     const uint64_t aligned_offset = AlignDown(request_offset, alignment);
     const uint64_t aligned_end = AlignUp(request_end, alignment);
@@ -348,26 +405,36 @@ class FileReadServiceImpl : public iouring_file_read::FileReadService {
       return SetInvalidArgument(resp, "aligned read length out of range");
     }
 
-    ReqCtx request_ctx;
-    if (request_ctx.done_butex == nullptr) {
-      resp->set_code(iouring_file_read::FILE_READ_INTERNAL);
-      resp->set_message("failed to create private butex");
-      return;
-    }
-    request_ctx.request_len = static_cast<size_t>(request_len);
-    request_ctx.prefix_skip = static_cast<size_t>(request_offset - aligned_offset);
-    const int prep_rc =
-        request_ctx.PrepareAlignedBuffer(alignment, static_cast<size_t>(aligned_len));
-    if (prep_rc != 0) {
-      return SetIoError(resp, prep_rc, "allocate aligned buffer failed");
-    }
     if (!g_worker_io) {
       resp->set_code(iouring_file_read::FILE_READ_INTERNAL);
       resp->set_message("worker io state unavailable");
       return;
     }
+    ReqCtx* request_ctx = g_worker_io->AcquireReqCtx();
+    if (request_ctx == nullptr) {
+      resp->set_code(iouring_file_read::FILE_READ_INTERNAL);
+      resp->set_message("req_ctx pool exhausted");
+      return;
+    }
+    struct ReqCtxReleaser {
+      WorkerIoState* owner = nullptr;
+      ReqCtx* req = nullptr;
+      ~ReqCtxReleaser() {
+        if (owner != nullptr && req != nullptr) {
+          owner->ReleaseReqCtx(req);
+        }
+      }
+    } releaser{g_worker_io, request_ctx};
+
+    request_ctx->request_len = static_cast<size_t>(request_len);
+    request_ctx->prefix_skip = static_cast<size_t>(request_offset - aligned_offset);
+    const int prep_rc =
+        request_ctx->EnsureAlignedBuffer(alignment, static_cast<size_t>(aligned_len));
+    if (prep_rc != 0) {
+      return SetIoError(resp, prep_rc, "allocate aligned buffer failed");
+    }
     const int submit_rc =
-        g_worker_io->QueueRead(fd, &request_ctx, static_cast<off_t>(aligned_offset));
+        g_worker_io->QueueRead(fd, request_ctx, static_cast<off_t>(aligned_offset));
     if (submit_rc != 0) {
       return SetIoError(resp, submit_rc, "io_uring submit read failed");
     }
@@ -383,9 +450,9 @@ class FileReadServiceImpl : public iouring_file_read::FileReadService {
       ts.tv_nsec -= 1000000000LL;
     }
 
-    const int wait_rc = bthread_butex_wait_local(request_ctx.done_butex, 0, &ts);
+    const int wait_rc = bthread_butex_wait_local(request_ctx->done_butex, 0, &ts);
     const int butex_value =
-        static_cast<butil::atomic<int>*>(request_ctx.done_butex)
+        static_cast<butil::atomic<int>*>(request_ctx->done_butex)
             ->load(butil::memory_order_acquire);
     if (wait_rc != 0 && errno != EWOULDBLOCK && butex_value == 0) {
       const int saved_errno = errno;
@@ -398,25 +465,25 @@ class FileReadServiceImpl : public iouring_file_read::FileReadService {
       return;
     }
 
-    if (request_ctx.wake_errno != 0) {
-      SetIoError(resp, request_ctx.wake_errno, "wake_within failed");
+    if (request_ctx->wake_errno != 0) {
+      SetIoError(resp, request_ctx->wake_errno, "wake_within failed");
       return;
     }
-    if (request_ctx.io_result < 0) {
-      SetIoError(resp, request_ctx.io_errno, "read failed");
+    if (request_ctx->io_result < 0) {
+      SetIoError(resp, request_ctx->io_errno, "read failed");
       return;
     }
 
     g_file_read_ops_total << 1;
     resp->set_code(iouring_file_read::FILE_READ_OK);
-    if (request_ctx.io_result <= static_cast<ssize_t>(request_ctx.prefix_skip)) {
+    if (request_ctx->io_result <= static_cast<ssize_t>(request_ctx->prefix_skip)) {
       resp->clear_body();
     } else {
       const size_t readable_after_skip =
-          static_cast<size_t>(request_ctx.io_result) - request_ctx.prefix_skip;
-      const size_t body_len = std::min(readable_after_skip, request_ctx.request_len);
+          static_cast<size_t>(request_ctx->io_result) - request_ctx->prefix_skip;
+      const size_t body_len = std::min(readable_after_skip, request_ctx->request_len);
       const char* body_ptr =
-          static_cast<const char*>(request_ctx.aligned_buffer) + request_ctx.prefix_skip;
+          static_cast<const char*>(request_ctx->aligned_buffer) + request_ctx->prefix_skip;
       resp->set_body(body_ptr, body_len);
     }
     resp->set_message("ok");
@@ -450,14 +517,11 @@ class BlockingFileReadServiceImpl : public iouring_file_read::BlockingFileReadSe
     if (req->offset() < 0) {
       return SetInvalidArgument(resp, "offset must be non-negative");
     }
-    if (req->len() <= 0) {
-      return SetInvalidArgument(resp, "len must be positive");
-    }
-    if (req->len() > FLAGS_max_read_len) {
-      return SetInvalidArgument(resp, "len exceeds max_read_len");
+    if (req->len() != FLAGS_read_len_bytes) {
+      return SetInvalidArgument(resp, "len must equal server --read_len_bytes");
     }
     if (req->offset() >
-        (std::numeric_limits<int64_t>::max() - static_cast<int64_t>(req->len()))) {
+        (std::numeric_limits<int64_t>::max() - static_cast<int64_t>(FLAGS_read_len_bytes))) {
       return SetInvalidArgument(resp, "offset + len overflow");
     }
 
@@ -481,7 +545,7 @@ class BlockingFileReadServiceImpl : public iouring_file_read::BlockingFileReadSe
     const int fd = g_shared_direct_fd;
 
     const uint64_t request_offset = static_cast<uint64_t>(req->offset());
-    const uint64_t request_len = static_cast<uint64_t>(req->len());
+    const uint64_t request_len = static_cast<uint64_t>(FLAGS_read_len_bytes);
     const uint64_t request_end = request_offset + request_len;
     const uint64_t aligned_offset = AlignDown(request_offset, alignment);
     const uint64_t aligned_end = AlignUp(request_end, alignment);
@@ -542,6 +606,17 @@ class BlockingFileReadServiceImpl : public iouring_file_read::BlockingFileReadSe
 
 int main(int argc, char* argv[]) {
   google::ParseCommandLineFlags(&argc, &argv, true);
+  if (FLAGS_read_len_bytes <= 0 ||
+      (FLAGS_read_len_bytes % static_cast<int32_t>(kReqCtxBufferSizeAlign)) != 0) {
+    LOG(ERROR) << "read_len_bytes must be positive and multiple of "
+               << kReqCtxBufferSizeAlign;
+    return 1;
+  }
+  if (FLAGS_read_len_bytes > FLAGS_max_read_len) {
+    LOG(ERROR) << "read_len_bytes(" << FLAGS_read_len_bytes
+               << ") exceeds max_read_len(" << FLAGS_max_read_len << ")";
+    return 1;
+  }
   g_shared_direct_fd = open(FLAGS_file_path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
   if (g_shared_direct_fd < 0) {
     LOG(ERROR) << "Fail to open file_path with O_DIRECT: " << FLAGS_file_path
