@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -7,12 +8,14 @@
 #include <exception>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <numeric>
 #include <random>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <brpc/channel.h>
@@ -29,13 +32,32 @@ DEFINE_int32(threads, 16, "worker threads");
 DEFINE_int32(duration_s, 60, "test duration in seconds");
 DEFINE_int32(report_interval_s, 1, "report interval in seconds");
 DEFINE_int64(file_size_bytes, 4LL << 30, "logical file size bound for random reads");
-DEFINE_int32(len_bytes, 32 * 1024, "request len in bytes");
+DEFINE_int32(len_bytes, 32 * 1024,
+             "request len in bytes, must be one of 1024/4096/16384/32768/65536");
 DEFINE_int32(timeout_ms, 5000, "rpc timeout");
 DEFINE_int32(max_retry, 0, "rpc max retry");
+DEFINE_int32(client_graceful_drain_ms, 5000,
+             "after duration_s, stop issuing new RPCs and drain inflight requests");
+DEFINE_string(connection_type, "",
+              "brpc ChannelOptions.connection_type, empty means brpc default");
+DEFINE_int32(rpc_fail_reason_top_n, 3,
+             "print top N rpc fail reasons in final report, <=0 disables output");
+DEFINE_bool(set_log_id, true,
+            "set brpc Controller.log_id on each request for end-to-end correlation");
+DEFINE_bool(set_request_id, true,
+            "set brpc Controller.request_id using the generated log_id");
+DEFINE_uint64(log_id_seed, 0,
+              "starting log_id, 0 means auto-seed from steady clock");
+DEFINE_int32(fail_sample_limit, 20,
+             "keep first N failure samples and print them in final report");
+DEFINE_bool(print_fail_sample_realtime, false,
+            "print one-line failure samples immediately when they happen");
 
 namespace {
 
 enum class ServiceKind { kIoUring, kBlocking };
+
+std::atomic<uint64_t> g_next_log_id{1};
 
 bool ParseServiceKind(const std::string& v, ServiceKind* out) {
   if (v == "io_uring") {
@@ -47,6 +69,11 @@ bool ParseServiceKind(const std::string& v, ServiceKind* out) {
     return true;
   }
   return false;
+}
+
+bool IsSupportedLenBytes(int len) {
+  return len == 1024 || len == 4096 || len == 16 * 1024 || len == 32 * 1024 ||
+         len == 64 * 1024;
 }
 
 bool ParseServicePortMap(const std::string& text, int* io_port, int* blocking_port) {
@@ -90,6 +117,11 @@ struct SharedStats {
   std::mutex mu;
   std::vector<double> window_lat_ms;
   std::vector<double> all_lat_ms;
+  std::unordered_map<int, uint64_t> rpc_fail_reason_counts;
+  std::unordered_map<int, std::string> rpc_fail_reason_samples;
+  std::unordered_map<int, uint64_t> app_fail_reason_counts;
+  std::unordered_map<int, std::string> app_fail_reason_samples;
+  std::vector<std::string> fail_samples;
   uint64_t window_total = 0;
   uint64_t window_ok = 0;
   uint64_t window_fail = 0;
@@ -101,6 +133,99 @@ struct SharedStats {
   uint64_t rpc_fail = 0;
   uint64_t app_fail = 0;
 };
+
+std::string SanitizeInlineText(const std::string& text) {
+  if (text.empty()) {
+    return "";
+  }
+  std::string out;
+  out.reserve(text.size());
+  for (unsigned char ch : text) {
+    if (std::isspace(ch)) {
+      out.push_back('_');
+    } else if (ch == '|' || ch == ',') {
+      out.push_back(';');
+    } else {
+      out.push_back(static_cast<char>(ch));
+    }
+  }
+  constexpr size_t kMaxLen = 120;
+  if (out.size() > kMaxLen) {
+    out.resize(kMaxLen - 3);
+    out.append("...");
+  }
+  return out;
+}
+
+std::string FormatRpcFailReasons(
+    const std::unordered_map<int, uint64_t>& counts,
+    const std::unordered_map<int, std::string>& samples, int top_n) {
+  if (counts.empty() || top_n <= 0) {
+    return "none";
+  }
+  std::vector<std::pair<int, uint64_t>> sorted;
+  sorted.reserve(counts.size());
+  for (const auto& kv : counts) {
+    sorted.push_back(kv);
+  }
+  std::sort(sorted.begin(), sorted.end(),
+            [](const std::pair<int, uint64_t>& a, const std::pair<int, uint64_t>& b) {
+              if (a.second != b.second) {
+                return a.second > b.second;
+              }
+              return a.first < b.first;
+            });
+  const size_t limit =
+      std::min(sorted.size(), static_cast<size_t>(std::max(0, top_n)));
+  if (limit == 0) {
+    return "none";
+  }
+  std::ostringstream os;
+  for (size_t i = 0; i < limit; ++i) {
+    if (i > 0) {
+      os << "|";
+    }
+    const int code = sorted[i].first;
+    os << code << ":" << sorted[i].second;
+    const auto it = samples.find(code);
+    if (it != samples.end() && !it->second.empty()) {
+      os << ":" << it->second;
+    }
+  }
+  return os.str();
+}
+
+uint64_t ResolveInitialLogIdSeed() {
+  if (FLAGS_log_id_seed != 0) {
+    return FLAGS_log_id_seed;
+  }
+  const uint64_t now_ns = static_cast<uint64_t>(
+      std::chrono::steady_clock::now().time_since_epoch().count());
+  const uint64_t seed = (now_ns & 0x7fffffffffffffffull) | 1ull;
+  return seed == 0 ? 1 : seed;
+}
+
+std::string FormatFailSample(bool rpc_fail, uint64_t log_id, int64_t off, double lat_ms,
+                             int rpc_error_code, const std::string& rpc_error_text,
+                             int app_code, const std::string& app_msg) {
+  std::ostringstream os;
+  if (rpc_fail) {
+    os << "type=rpc"
+       << " log_id=" << log_id
+       << " off=" << off
+       << " lat_ms=" << std::fixed << std::setprecision(3) << lat_ms
+       << " rpc_code=" << rpc_error_code
+       << " rpc_text=" << (rpc_error_text.empty() ? "-" : rpc_error_text);
+    return os.str();
+  }
+  os << "type=app"
+     << " log_id=" << log_id
+     << " off=" << off
+     << " lat_ms=" << std::fixed << std::setprecision(3) << lat_ms
+     << " app_code=" << app_code
+     << " app_msg=" << (app_msg.empty() ? "-" : app_msg);
+  return os.str();
+}
 
 double Percentile(std::vector<double>& sorted, double q) {
   if (sorted.empty()) {
@@ -123,12 +248,24 @@ double Percentile(std::vector<double>& sorted, double q) {
 }
 
 void WorkerThread(const std::string& server_addr, ServiceKind kind, SharedStats* stats,
-                  const std::atomic<bool>* stop) {
+                  const std::atomic<bool>* stop_issue_new, std::atomic<int>* live_workers) {
+  struct ExitGuard {
+    std::atomic<int>* counter = nullptr;
+    ~ExitGuard() {
+      if (counter != nullptr) {
+        counter->fetch_sub(1, std::memory_order_relaxed);
+      }
+    }
+  } exit_guard{live_workers};
+
   brpc::Channel channel;
   brpc::ChannelOptions options;
   options.protocol = "baidu_std";
   options.timeout_ms = FLAGS_timeout_ms;
   options.max_retry = FLAGS_max_retry;
+  if (!FLAGS_connection_type.empty()) {
+    options.connection_type = FLAGS_connection_type;
+  }
   if (channel.Init(server_addr.c_str(), nullptr, &options) != 0) {
     std::cerr << "[worker] failed to init channel to " << server_addr << '\n';
     return;
@@ -141,7 +278,10 @@ void WorkerThread(const std::string& server_addr, ServiceKind kind, SharedStats*
       static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&rng)));
 
   iouring_file_read::FileReadRequest req;
-  while (!stop->load(std::memory_order_relaxed)) {
+  while (true) {
+    if (stop_issue_new->load(std::memory_order_relaxed)) {
+      break;
+    }
     const int64_t max_off = std::max<int64_t>(0, FLAGS_file_size_bytes - FLAGS_len_bytes);
     const int64_t max_slot = max_off / 4096;
     std::uniform_int_distribution<int64_t> off_dist(0, max_slot);
@@ -150,6 +290,14 @@ void WorkerThread(const std::string& server_addr, ServiceKind kind, SharedStats*
     req.set_len(FLAGS_len_bytes);
 
     brpc::Controller cntl;
+    uint64_t log_id = 0;
+    if (FLAGS_set_log_id) {
+      log_id = g_next_log_id.fetch_add(1, std::memory_order_relaxed);
+      cntl.set_log_id(log_id);
+      if (FLAGS_set_request_id) {
+        cntl.set_request_id("bench-" + std::to_string(log_id));
+      }
+    }
     iouring_file_read::FileReadResponse rsp;
     const auto begin = std::chrono::steady_clock::now();
     if (kind == ServiceKind::kIoUring) {
@@ -166,6 +314,24 @@ void WorkerThread(const std::string& server_addr, ServiceKind kind, SharedStats*
     const bool ok = rpc_ok && app_ok;
     const bool is_rpc_fail = !rpc_ok;
     const bool is_app_fail = rpc_ok && !app_ok;
+    int rpc_error_code = 0;
+    std::string rpc_error_text;
+    int app_error_code = 0;
+    std::string app_error_text;
+    if (is_rpc_fail) {
+      rpc_error_code = cntl.ErrorCode();
+      rpc_error_text = SanitizeInlineText(cntl.ErrorText());
+    } else if (is_app_fail) {
+      app_error_code = rsp.code();
+      app_error_text = SanitizeInlineText(rsp.message());
+    }
+    const std::string fail_sample =
+        ok ? std::string() : FormatFailSample(is_rpc_fail, log_id, off, lat_ms,
+                                              rpc_error_code, rpc_error_text,
+                                              app_error_code, app_error_text);
+    if (!ok && FLAGS_print_fail_sample_realtime) {
+      std::cerr << "[fail ] " << fail_sample << '\n';
+    }
 
     {
       std::lock_guard<std::mutex> lk(stats->mu);
@@ -182,9 +348,29 @@ void WorkerThread(const std::string& server_addr, ServiceKind kind, SharedStats*
         if (is_rpc_fail) {
           ++stats->window_rpc_fail;
           ++stats->rpc_fail;
+          ++stats->rpc_fail_reason_counts[rpc_error_code];
+          if (!rpc_error_text.empty()) {
+            const auto inserted =
+                stats->rpc_fail_reason_samples.emplace(rpc_error_code, rpc_error_text);
+            if (!inserted.second && inserted.first->second.empty()) {
+              inserted.first->second = rpc_error_text;
+            }
+          }
         } else {
           ++stats->window_app_fail;
           ++stats->app_fail;
+          ++stats->app_fail_reason_counts[app_error_code];
+          if (!app_error_text.empty()) {
+            const auto inserted =
+                stats->app_fail_reason_samples.emplace(app_error_code, app_error_text);
+            if (!inserted.second && inserted.first->second.empty()) {
+              inserted.first->second = app_error_text;
+            }
+          }
+        }
+        if (FLAGS_fail_sample_limit > 0 &&
+            stats->fail_samples.size() < static_cast<size_t>(FLAGS_fail_sample_limit)) {
+          stats->fail_samples.push_back(fail_sample);
         }
       }
     }
@@ -193,7 +379,11 @@ void WorkerThread(const std::string& server_addr, ServiceKind kind, SharedStats*
 
 void PrintReport(double elapsed_s, uint64_t total, uint64_t ok, uint64_t fail,
                  uint64_t rpc_fail, uint64_t app_fail, std::vector<double> lats_ms,
-                 const std::string& prefix, const std::string& service_name) {
+                 const std::string& prefix, const std::string& service_name, double issue_s = -1.0,
+                 double tail_s = -1.0, uint64_t tail_total = 0, uint64_t tail_fail = 0,
+                 uint64_t tail_rpc_fail = 0, uint64_t tail_app_fail = 0,
+                 const std::string& rpc_fail_reasons = "",
+                 const std::string& app_fail_reasons = "") {
   if (lats_ms.empty()) {
     std::cout << prefix << " t=" << std::fixed << std::setprecision(1) << elapsed_s
               << "s service=" << service_name << " no-samples\n";
@@ -210,9 +400,23 @@ void PrintReport(double elapsed_s, uint64_t total, uint64_t ok, uint64_t fail,
   std::cout << prefix << " t=" << std::fixed << std::setprecision(1) << elapsed_s << "s "
             << "service=" << service_name << " total=" << total << " ok=" << ok
             << " fail=" << fail << " (rpc=" << rpc_fail << ",app=" << app_fail << ") succ="
-            << std::setprecision(2) << succ << "% qps=" << qps << " avg="
+            << std::setprecision(2) << succ << "% iface_qps=" << qps << " avg="
             << std::setprecision(3) << avg << "ms p99=" << p99 << "ms p999=" << p999
-            << "ms p9999=" << p9999 << "ms\n";
+            << "ms p9999=" << p9999 << "ms";
+  if (issue_s >= 0.0 && tail_s >= 0.0) {
+    std::cout << " issue_t=" << std::setprecision(1) << issue_s
+              << "s tail_t=" << std::setprecision(1) << tail_s
+              << "s wall_t=" << std::setprecision(1) << elapsed_s
+              << "s tail_total=" << tail_total
+              << " tail_fail=" << tail_fail
+              << " tail_rpc_fail=" << tail_rpc_fail
+              << " tail_app_fail=" << tail_app_fail
+              << " rpc_fail_reasons="
+              << (rpc_fail_reasons.empty() ? "none" : rpc_fail_reasons)
+              << " app_fail_reasons="
+              << (app_fail_reasons.empty() ? "none" : app_fail_reasons);
+  }
+  std::cout << '\n';
 }
 
 }  // namespace
@@ -220,8 +424,14 @@ void PrintReport(double elapsed_s, uint64_t total, uint64_t ok, uint64_t fail,
 int main(int argc, char** argv) {
   google::ParseCommandLineFlags(&argc, &argv, true);
   if (FLAGS_threads <= 0 || FLAGS_duration_s <= 0 || FLAGS_report_interval_s <= 0 ||
-      FLAGS_len_bytes <= 0 || FLAGS_file_size_bytes < FLAGS_len_bytes) {
+      FLAGS_len_bytes <= 0 || FLAGS_file_size_bytes < FLAGS_len_bytes ||
+      FLAGS_client_graceful_drain_ms < 0 || FLAGS_rpc_fail_reason_top_n < 0 ||
+      FLAGS_fail_sample_limit < 0) {
     std::cerr << "invalid arguments\n";
+    return 1;
+  }
+  if (!IsSupportedLenBytes(FLAGS_len_bytes)) {
+    std::cerr << "invalid --len_bytes, must be one of 1024/4096/16384/32768/65536\n";
     return 1;
   }
 
@@ -240,18 +450,27 @@ int main(int argc, char** argv) {
   const std::string target_service_name =
       (kind == ServiceKind::kIoUring) ? "io_uring" : "blocking";
   const std::string mapped_addr = FLAGS_host + ":" + std::to_string(target_port);
+  const uint64_t log_id_seed = ResolveInitialLogIdSeed();
+  g_next_log_id.store(log_id_seed, std::memory_order_relaxed);
   std::cout << "target=" << mapped_addr << " service=" << target_service_name
             << " map={" << FLAGS_service_port_map << "} threads=" << FLAGS_threads
             << " duration=" << FLAGS_duration_s
             << "s len=" << FLAGS_len_bytes
-            << " file_size_bound=" << FLAGS_file_size_bytes << '\n';
+            << " file_size_bound=" << FLAGS_file_size_bytes
+            << " drain_ms=" << FLAGS_client_graceful_drain_ms
+            << " set_log_id=" << (FLAGS_set_log_id ? "1" : "0")
+            << " set_request_id=" << (FLAGS_set_request_id ? "1" : "0")
+            << " log_id_seed=" << log_id_seed
+            << " fail_sample_limit=" << FLAGS_fail_sample_limit << '\n';
 
   SharedStats stats;
-  std::atomic<bool> stop{false};
+  std::atomic<bool> stop_issue_new{false};
+  std::atomic<int> live_workers{FLAGS_threads};
   std::vector<std::thread> workers;
   workers.reserve(static_cast<size_t>(FLAGS_threads));
   for (int i = 0; i < FLAGS_threads; ++i) {
-    workers.emplace_back(WorkerThread, mapped_addr, kind, &stats, &stop);
+    workers.emplace_back(WorkerThread, mapped_addr, kind, &stats, &stop_issue_new,
+                         &live_workers);
   }
 
   const auto begin = std::chrono::steady_clock::now();
@@ -289,16 +508,48 @@ int main(int argc, char** argv) {
     }
   }
 
-  stop.store(true, std::memory_order_relaxed);
+  stop_issue_new.store(true, std::memory_order_relaxed);
+  const auto issue_end = std::chrono::steady_clock::now();
+  uint64_t issue_snapshot_total = 0;
+  uint64_t issue_snapshot_fail = 0;
+  uint64_t issue_snapshot_rpc_fail = 0;
+  uint64_t issue_snapshot_app_fail = 0;
+  {
+    std::lock_guard<std::mutex> lk(stats.mu);
+    issue_snapshot_total = stats.total;
+    issue_snapshot_fail = stats.fail;
+    issue_snapshot_rpc_fail = stats.rpc_fail;
+    issue_snapshot_app_fail = stats.app_fail;
+  }
+  const auto drain_begin = std::chrono::steady_clock::now();
+  const auto drain_deadline =
+      drain_begin + std::chrono::milliseconds(FLAGS_client_graceful_drain_ms);
+  while (live_workers.load(std::memory_order_relaxed) > 0 &&
+         std::chrono::steady_clock::now() < drain_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  if (live_workers.load(std::memory_order_relaxed) > 0) {
+    std::cerr << "[drain] deadline reached with " << live_workers.load(std::memory_order_relaxed)
+              << " worker(s) still waiting for inflight RPCs\n";
+  }
   for (auto& t : workers) {
     t.join();
   }
 
   const auto end = std::chrono::steady_clock::now();
-  const double total_s =
+  const double wall_s =
       std::chrono::duration_cast<std::chrono::duration<double>>(end - begin).count();
+  const double issue_s =
+      std::chrono::duration_cast<std::chrono::duration<double>>(issue_end - begin).count();
+  const double tail_s =
+      std::chrono::duration_cast<std::chrono::duration<double>>(end - issue_end).count();
 
   std::vector<double> all;
+  std::unordered_map<int, uint64_t> rpc_fail_reason_counts;
+  std::unordered_map<int, std::string> rpc_fail_reason_samples;
+  std::unordered_map<int, uint64_t> app_fail_reason_counts;
+  std::unordered_map<int, std::string> app_fail_reason_samples;
+  std::vector<std::string> fail_samples;
   uint64_t total = 0;
   uint64_t ok = 0;
   uint64_t fail = 0;
@@ -312,8 +563,30 @@ int main(int argc, char** argv) {
     fail = stats.fail;
     rpc_fail = stats.rpc_fail;
     app_fail = stats.app_fail;
+    rpc_fail_reason_counts = stats.rpc_fail_reason_counts;
+    rpc_fail_reason_samples = stats.rpc_fail_reason_samples;
+    app_fail_reason_counts = stats.app_fail_reason_counts;
+    app_fail_reason_samples = stats.app_fail_reason_samples;
+    fail_samples = stats.fail_samples;
   }
-  PrintReport(total_s, total, ok, fail, rpc_fail, app_fail, std::move(all), "[final ]",
-              target_service_name);
+  const auto sub_or_zero = [](uint64_t after, uint64_t before) -> uint64_t {
+    return after >= before ? (after - before) : 0;
+  };
+  const uint64_t tail_total = sub_or_zero(total, issue_snapshot_total);
+  const uint64_t tail_fail = sub_or_zero(fail, issue_snapshot_fail);
+  const uint64_t tail_rpc_fail = sub_or_zero(rpc_fail, issue_snapshot_rpc_fail);
+  const uint64_t tail_app_fail = sub_or_zero(app_fail, issue_snapshot_app_fail);
+  const std::string rpc_fail_reasons = FormatRpcFailReasons(
+      rpc_fail_reason_counts, rpc_fail_reason_samples, FLAGS_rpc_fail_reason_top_n);
+  const std::string app_fail_reasons = FormatRpcFailReasons(
+      app_fail_reason_counts, app_fail_reason_samples, FLAGS_rpc_fail_reason_top_n);
+  PrintReport(wall_s, total, ok, fail, rpc_fail, app_fail, std::move(all), "[final ]",
+              target_service_name, issue_s, tail_s, tail_total, tail_fail, tail_rpc_fail,
+              tail_app_fail, rpc_fail_reasons, app_fail_reasons);
+  if (!fail_samples.empty()) {
+    for (size_t i = 0; i < fail_samples.size(); ++i) {
+      std::cout << "[final-fail] idx=" << (i + 1) << " " << fail_samples[i] << '\n';
+    }
+  }
   return 0;
 }

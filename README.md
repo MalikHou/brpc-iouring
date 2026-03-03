@@ -1,37 +1,41 @@
 # brpc-iouring
 
-Standalone brpc + io_uring file-read server.
+`brpc + io_uring` 文件读取服务（固定 `O_DIRECT` 路径）。
 
-## Responsibilities
+服务提供两个 RPC 接口：
+- `io_uring` 服务（端口默认 `8040`）
+- `blocking` 服务（端口默认 `8042`）
 
-- `bootstrap_server_deps.sh` only prepares dependencies and `brpc`.
-- Service build is done by CMake commands in this README.
+## 目录与产物
 
-Dependency outputs:
+- 依赖安装目录：`third_party/install`
+- brpc 源码与构建目录：`third_party/src/brpc`
+- 服务端二进制：`build/file_read_server`
+- 压测客户端二进制：`scripts/brpc_latency_monitor`
 
-- `third_party/src`
-- `third_party/install`
+## 1. 依赖安装
 
-Service binary output (after CMake build):
-
-- `build/file_read_server`
-
-## 1) Bootstrap dependencies
+在仓库根目录执行：
 
 ```bash
 cd ./brpc-iouring
 ./bootstrap_server_deps.sh
 ```
 
-The script:
+该脚本会：
+- 安装系统依赖（`build-essential`、`cmake`、`git`、`curl`、`pkg-config` 等）
+- 编译并安装三方库：`zlib`、`openssl`、`gflags`、`protobuf`、`snappy`、`leveldb`、`liburing`
+- 拉取并编译指定分支的 `brpc`
 
-- installs required system packages
-- builds and installs `zlib`, `openssl`, `gflags`, `protobuf`, `snappy`, `leveldb`, `liburing`
-- clones and builds `brpc` from `malikhou/add_active_task`
+可选：指定 brpc 仓库或分支
 
-It does **not** build this repository's server binary.
+```bash
+BRPC_REPO=https://github.com/MalikHou/brpc.git \
+BRPC_BRANCH=malikhou/add_active_task \
+./bootstrap_server_deps.sh
+```
 
-## 2) Build server
+## 2. 编译服务端
 
 ```bash
 cd ./brpc-iouring
@@ -43,23 +47,21 @@ cmake --build build -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
 ln -sfn build/compile_commands.json compile_commands.json
 ```
 
-## 3) Start server
+## 3. 准备测试文件（O_DIRECT）
 
-Create a 4GiB aligned test file for O_DIRECT (default benchmark size).
-
-Option A (recommended for realistic data):
+推荐生成 4GiB 文件：
 
 ```bash
 dd if=/dev/urandom of=/tmp/iouring-directio.bin bs=4M count=1024 status=progress
 ```
 
-Option B (faster generation, zero-filled):
+（或更快的零填充版本）
 
 ```bash
 dd if=/dev/zero of=/tmp/iouring-directio.bin bs=4M count=1024
 ```
 
-Run:
+## 4. 启动服务端
 
 ```bash
 ./build/file_read_server \
@@ -72,63 +74,22 @@ Run:
   --read_num_threads=12 \
   --blocking_num_threads=12 \
   --monitor_num_threads=4 \
-  --read_len_bytes=32768 \
   --file_path=/tmp/iouring-directio.bin
 ```
 
-## 4) Verify
+说明：
+- 当前版本固定 direct-io 路径；请求大小由客户端 `req.len` 控制。
+- `req.len` 仅支持这五档：`1024`、`4096`、`16384`、`32768`、`65536`。
+- 兼容保留参数（如 `--iouring_mode`、`--read_len_bytes`）会被忽略。
+
+## 5. 启动后检查
 
 ```bash
-curl -s http://127.0.0.1:8041/status | sed -n '1,5p'
+curl -s http://127.0.0.1:8041/status | sed -n '1,20p'
+curl -s http://127.0.0.1:8041/vars | egrep 'file_read_iops|file_read_blocking_iops'
 ```
 
-Service endpoints (same request/response):
-
-- io_uring service: `/iouring_file_read.FileReadService/Read` (tag 1, port 8040, O_DIRECT)
-- blocking service: `/iouring_file_read.BlockingFileReadService/Read` (tag 2, port 8042, O_DIRECT)
-
-```bash
-ldd ./build/file_read_server | sed -n '/libbrpc\|liburing\|libprotobuf\|libgflags\|libleveldb\|libsnappy\|libssl\|libcrypto\|libz/p'
-```
-
-## Clean rebuild
-
-```bash
-rm -rf build third_party
-./bootstrap_server_deps.sh
-```
-
-## Runtime notes
-
-- Linux kernel must support io_uring.
-- Runtime policy must allow io_uring syscalls.
-- `--file_path` target must exist for O_DIRECT open.
-
-If startup log contains:
-
-```text
-worker io_uring init failed, rc=1
-```
-
-this is usually an environment/kernel restriction, not a dependency link failure.
-
-## Docker
-
-```bash
-docker build -t brpc-iouring:latest .
-```
-
-```bash
-docker run --rm -it \
-  --privileged \
-  --security-opt seccomp=unconfined \
-  -p 8040:8040 -p 8041:8041 \
-  brpc-iouring:latest
-```
-
-## C++ client benchmark
-
-Compile:
+## 6. 编译客户端
 
 ```bash
 c++ -O2 -std=c++17 scripts/brpc_latency_monitor.cpp build/file_read.pb.cc \
@@ -139,42 +100,62 @@ c++ -O2 -std=c++17 scripts/brpc_latency_monitor.cpp build/file_read.pb.cc \
   -o scripts/brpc_latency_monitor
 ```
 
-Run:
+## 7. 客户端使用方法
+
+### 7.1 io_uring 服务
 
 ```bash
 ./scripts/brpc_latency_monitor \
-  --host=10.192.101.15 \
+  --host=127.0.0.1 \
   --service=io_uring \
   --service_port_map=io_uring:8040,blocking:8042 \
-  --len_bytes=32768 \
   --threads=32 \
-  --duration_s=20
+  --duration_s=30 \
+  --timeout_ms=10000 \
+  --len_bytes=32768 \
+  --file_size_bytes=$((4*1024*1024*1024))
 ```
 
-Switch to blocking service:
+### 7.2 blocking 服务
 
 ```bash
 ./scripts/brpc_latency_monitor \
-  --host=10.192.101.15 \
+  --host=127.0.0.1 \
   --service=blocking \
   --service_port_map=io_uring:8040,blocking:8042 \
-  --len_bytes=32768 \
   --threads=32 \
-  --duration_s=20
+  --duration_s=30 \
+  --timeout_ms=10000 \
+  --len_bytes=32768 \
+  --file_size_bytes=$((4*1024*1024*1024))
 ```
 
-Client behavior:
-
-- server requires `req.len == --read_len_bytes` (default `32768`), otherwise returns invalid argument
-- ReqCtx pool buffer capacity grows by `--read_len_bytes`
-- client should use matching `--len_bytes` (default `32768`)
-- random `offset` aligned to 4K
-- bounded by `--file_size_bytes` (default `4GiB`) so reads never exceed the 4GiB range
-
-## Optional bootstrap overrides
+### 7.3 批量测试五档读大小
 
 ```bash
-BRPC_BRANCH=malikhou/add_active_task \
-BRPC_REPO=https://github.com/MalikHou/brpc.git \
+for len in 1024 4096 16384 32768 65536; do
+  ./scripts/brpc_latency_monitor \
+    --host=127.0.0.1 \
+    --service=io_uring \
+    --service_port_map=io_uring:8040,blocking:8042 \
+    --threads=32 \
+    --duration_s=20 \
+    --timeout_ms=10000 \
+    --len_bytes=${len} \
+    --file_size_bytes=$((4*1024*1024*1024))
+done
+```
+
+### 7.4 客户端输出指标
+
+窗口与最终输出都会包含：
+- `iface_qps`（客户端接口 QPS）
+- `avg`（平均延迟）
+- `p99` / `p999` / `p9999`（延迟分位）
+
+## 8. 清理重建
+
+```bash
+rm -rf build third_party
 ./bootstrap_server_deps.sh
 ```
