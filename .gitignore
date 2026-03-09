@@ -1,5 +1,10 @@
 # CMake / build outputs
 build/
+gcc_server/
+clang_server/
+gcc_client/
+clang_client/
+build_client/
 cmake-build-*/
 CMakeFiles/
 CMakeCache.txt

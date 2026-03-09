@@ -1,161 +1,161 @@
-# brpc-iouring
+# brpc iouring vs pread benchmark
 
-`brpc + io_uring` 文件读取服务（固定 `O_DIRECT` 路径）。
+一个干净的 `server + client` 对比工程：
+- `io_uring` 路径：基于 active task，在 `Harvest` 里做提交、收割、唤醒。
+- `pread` 路径：直接同步 `pread`。
 
-服务提供两个 RPC 接口：
-- `io_uring` 服务（端口默认 `8040`）
-- `blocking` 服务（端口默认 `8042`）
-
-## 目录与产物
-
-- 依赖安装目录：`third_party/install`
-- brpc 源码与构建目录：`third_party/src/brpc`
-- 服务端二进制：`build/file_read_server`
-- 压测客户端二进制：`scripts/brpc_latency_monitor`
-
-## 1. 依赖安装
-
-在仓库根目录执行：
+## 安装依赖
 
 ```bash
-cd ./brpc-iouring
 ./bootstrap_server_deps.sh
 ```
 
-该脚本会：
-- 安装系统依赖（`build-essential`、`cmake`、`git`、`curl`、`pkg-config` 等）
-- 编译并安装三方库：`zlib`、`openssl`、`gflags`、`protobuf`、`snappy`、`leveldb`、`liburing`
-- 拉取并编译指定分支的 `brpc`
-
-可选：指定 brpc 仓库或分支
+## 1. 清空并更新本地 third_party 依赖
 
 ```bash
-BRPC_REPO=https://github.com/MalikHou/brpc.git \
-BRPC_BRANCH=malikhou/add_active_task \
-./bootstrap_server_deps.sh
+./bootstrap_server_deps.sh --clean
 ```
 
-## 2. 编译服务端
+如果希望 brpc 仓库也完全重拉（而不是复用已有 `third_party/src/brpc`），可用：
 
 ```bash
-cd ./brpc-iouring
-rm -rf build
-cmake -S . -B build \
+./bootstrap_server_deps.sh --clean --reclone-brpc
+```
+
+该脚本会强制对齐 `origin/malikhou/add_active_task` 最新提交，依赖与产物均位于本地 `third_party/` 目录。
+
+## 2. 编译（gcc + clang 都跑一次，目录分离）
+
+```bash
+./scripts/build_gcc_clang.sh
+```
+
+`FORCE_STATIC_THIRD_PARTY=ON` 会优先链接 `third_party` 下的静态库（`.a`）。
+
+等价的手工 CMake 命令（目录按 `gcc_*` / `clang_*` 区分）：
+
+```bash
+cmake -S server -B gcc_server \
+  -DCMAKE_CXX_COMPILER=g++ \
+  -DPROTOC_EXECUTABLE="$PWD/third_party/install/bin/protoc" \
+  -DFORCE_STATIC_THIRD_PARTY=ON \
   -DBRPC_ROOT="$PWD/third_party/src/brpc/output" \
-  -DTHIRD_PARTY_ROOT="$PWD/third_party/install"
-cmake --build build -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
-ln -sfn build/compile_commands.json compile_commands.json
+  -DDEPS_ROOT="$PWD/third_party/install"
+cmake --build gcc_server -j"$(nproc)"
+
+cmake -S client -B gcc_client \
+  -DCMAKE_CXX_COMPILER=g++ \
+  -DPROTOC_EXECUTABLE="$PWD/third_party/install/bin/protoc" \
+  -DFORCE_STATIC_THIRD_PARTY=ON \
+  -DBRPC_ROOT="$PWD/third_party/src/brpc/output" \
+  -DDEPS_ROOT="$PWD/third_party/install"
+cmake --build gcc_client -j"$(nproc)"
+
+cmake -S server -B clang_server \
+  -DCMAKE_CXX_COMPILER=clang++ \
+  -DPROTOC_EXECUTABLE="$PWD/third_party/install/bin/protoc" \
+  -DFORCE_STATIC_THIRD_PARTY=ON \
+  -DBRPC_ROOT="$PWD/third_party/src/brpc/output" \
+  -DDEPS_ROOT="$PWD/third_party/install"
+cmake --build clang_server -j"$(nproc)"
+
+cmake -S client -B clang_client \
+  -DCMAKE_CXX_COMPILER=clang++ \
+  -DPROTOC_EXECUTABLE="$PWD/third_party/install/bin/protoc" \
+  -DFORCE_STATIC_THIRD_PARTY=ON \
+  -DBRPC_ROOT="$PWD/third_party/src/brpc/output" \
+  -DDEPS_ROOT="$PWD/third_party/install"
+cmake --build clang_client -j"$(nproc)"
 ```
 
-## 3. 准备测试文件（O_DIRECT）
+产物：
+- `gcc_server/read_bench_server`
+- `gcc_client/read_bench_client`
+- `clang_server/read_bench_server`
+- `clang_client/read_bench_client`
 
-推荐生成 4GiB 文件：
+## 3. 准备测试文件
 
 ```bash
-dd if=/dev/urandom of=/tmp/iouring-directio.bin bs=4M count=1024 status=progress
+dd if=/dev/urandom of=/data/read_bench.data bs=4M count=1024 status=progress
 ```
 
-（或更快的零填充版本）
+## 4. 启动 server（单进程 3 个 server / 3 个 tag）
 
 ```bash
-dd if=/dev/zero of=/tmp/iouring-directio.bin bs=4M count=1024
-```
-
-## 4. 启动服务端
-
-```bash
-./build/file_read_server \
-  --port=8040 \
-  --blocking_port=8042 \
-  --monitor_port=8041 \
-  --read_tag=1 \
-  --blocking_tag=2 \
+# 或 ./clang_server/read_bench_server
+./gcc_server/read_bench_server \
+  --monitor_port=8010 \
   --monitor_tag=0 \
-  --read_num_threads=12 \
-  --blocking_num_threads=12 \
-  --monitor_num_threads=4 \
-  --file_path=/tmp/iouring-directio.bin
+  --port=8002 \
+  --iouring_tag=1 \
+  --pread_port=8003 \
+  --pread_tag=2 \
+  --file_path=/data/read_bench.data \
+  --num_threads=5 \
+  --monitor_num_threads=5 \
+  --iouring_queue_depth=256 \
+  --max_read_size=65536 \
+  --file_direct_io=true
 ```
 
 说明：
-- 当前版本固定 direct-io 路径；请求大小由客户端 `req.len` 控制。
-- `req.len` 仅支持这五档：`1024`、`4096`、`16384`、`32768`、`65536`。
-- 兼容保留参数（如 `--iouring_mode`、`--read_len_bytes`）会被忽略。
+- `monitor` server 只提供 builtin 服务，绑定 `tag0`
+- `io_uring` server 只提供 `IoUringReadService`，绑定 `tag1`
+- `pread` server 只提供 `PreadReadService`，绑定 `tag2`
+- 服务端和客户端都会在启动时强制打开 `event_dispatcher_edisp_unsched=true`
+- `io_uring` 读等待使用无超时死等（请求不返回就持续等待）
+- `--file_open_flags` 支持直接传 `open(2)` flags 数值（默认 `O_RDONLY|O_CLOEXEC`）
+- 需要 direct io 时，优先使用 `--file_direct_io=true`（会自动追加 `O_DIRECT`）
+- 开启 `--file_direct_io=true` 时，请求 `offset/len` 需要按启动日志里的 `direct_io_offset_align` 对齐
+- direct io 场景建议在 client 侧设置 `--request_align=<direct_io_offset_align>`，并保证 `--read_size` 是该值的整数倍
+- 若 `--max_read_size < direct_io_offset_align`，server 会在启动时直接报错退出
 
-## 5. 启动后检查
-
-```bash
-curl -s http://127.0.0.1:8041/status | sed -n '1,20p'
-curl -s http://127.0.0.1:8041/vars | egrep 'file_read_iops|file_read_blocking_iops'
-```
-
-## 6. 编译客户端
-
-```bash
-c++ -O2 -std=c++17 scripts/brpc_latency_monitor.cpp build/file_read.pb.cc \
-  -Ibuild -Ithird_party/install/include -Ithird_party/src/brpc/output/include \
-  -Lthird_party/src/brpc/output/lib -Lthird_party/install/lib \
-  -Wl,-rpath,'$ORIGIN/../third_party/src/brpc/output/lib:$ORIGIN/../third_party/install/lib' \
-  -lbrpc -lprotobuf -lgflags -lleveldb -lsnappy -lssl -lcrypto -lz -luring -ldl -lrt -pthread \
-  -o scripts/brpc_latency_monitor
-```
-
-## 7. 客户端使用方法
-
-### 7.1 io_uring 服务
+## 5. 启动 client（可按参数选择 io_uring / pread）
 
 ```bash
-./scripts/brpc_latency_monitor \
-  --host=127.0.0.1 \
+# 或 ./clang_client/read_bench_client
+./gcc_client/read_bench_client \
   --service=io_uring \
-  --service_port_map=io_uring:8040,blocking:8042 \
-  --threads=32 \
+  --iouring_server_addr=127.0.0.1:8002 \
+  --pread_server_addr=127.0.0.1:8003 \
+  --concurrency=8 \
   --duration_s=30 \
-  --timeout_ms=10000 \
-  --len_bytes=32768 \
-  --file_size_bytes=$((4*1024*1024*1024))
+  --request_align=4096 \
+  --read_size=4096 \
+  --file_size=$((64*1024*1024))
 ```
 
-### 7.2 blocking 服务
+可选值：
+- `--service=io_uring`：只请求 `IoUringReadService`
+- `--service=pread`：只请求 `PreadReadService`
+
+示例输出：
+
+```text
+no-timeout mode: channel timeout_ms=-1, connect_timeout_ms=-1
+timed benchmark: duration_s=30, per-second metrics enabled
+[io_uring] sec=1 ok=73412 fail=0 qps=73412.00 mbps=286.77 avg_us=201 p50_us=188 p99_us=451 p999_us=690 p9999_us=1210
+...
+[pread] sec=1 ok=91420 fail=0 qps=91420.00 mbps=357.11 avg_us=163 p50_us=158 p99_us=280 p999_us=410 p9999_us=740
+=== final ===
+io_uring   total_ok=2190460 total_fail=0 qps=73015.33 mbps=285.21 avg_us=198 p50_us=186 p99_us=439 p999_us=675 p9999_us=1188
+pread      total_ok=2740832 total_fail=0 qps=91361.07 mbps=356.88 avg_us=160 p50_us=156 p99_us=276 p999_us=404 p9999_us=731
+speedup_qps(io_uring/pread)=0.799
+speedup_p99_latency(pread/io_uring)=0.629
+```
+
+## 6. perf 采样脚本
+
+按进程 PID 采样（`perf stat + pidstat`）：
 
 ```bash
-./scripts/brpc_latency_monitor \
-  --host=127.0.0.1 \
-  --service=blocking \
-  --service_port_map=io_uring:8040,blocking:8042 \
-  --threads=32 \
-  --duration_s=30 \
-  --timeout_ms=10000 \
-  --len_bytes=32768 \
-  --file_size_bytes=$((4*1024*1024*1024))
+./scripts/collect_perf_by_pid.sh --pid <PID> --duration_s 30
 ```
 
-### 7.3 批量测试五档读大小
+## 7. 代码结构
 
-```bash
-for len in 1024 4096 16384 32768 65536; do
-  ./scripts/brpc_latency_monitor \
-    --host=127.0.0.1 \
-    --service=io_uring \
-    --service_port_map=io_uring:8040,blocking:8042 \
-    --threads=32 \
-    --duration_s=20 \
-    --timeout_ms=10000 \
-    --len_bytes=${len} \
-    --file_size_bytes=$((4*1024*1024*1024))
-done
-```
-
-### 7.4 客户端输出指标
-
-窗口与最终输出都会包含：
-- `iface_qps`（客户端接口 QPS）
-- `avg`（平均延迟）
-- `p99` / `p999` / `p9999`（延迟分位）
-
-## 8. 清理重建
-
-```bash
-rm -rf build third_party
-./bootstrap_server_deps.sh
-```
+- `file_read.proto`: 两个服务 `IoUringReadService` / `PreadReadService`
+- `server/main.cpp`: 单进程三 server（monitor/iouring/pread）
+- `client/main.cpp`: 并发压测并输出 QPS、吞吐、延迟分位
+- `server/CMakeLists.txt`、`client/CMakeLists.txt`: 分离构建配置

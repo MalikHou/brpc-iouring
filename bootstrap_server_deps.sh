@@ -27,6 +27,38 @@ GFLAGS_VERSION="${GFLAGS_VERSION:-v2.2.2}"
 PROTOBUF_VERSION="${PROTOBUF_VERSION:-v3.19.6}"
 SNAPPY_VERSION="${SNAPPY_VERSION:-1.1.10}"
 LEVELDB_VERSION="${LEVELDB_VERSION:-1.23}"
+CLEAN_THIRD_PARTY=0
+RECLEAN_BRPC_SRC=0
+
+usage() {
+  cat <<'EOF'
+Usage: ./bootstrap_server_deps.sh [--clean] [--reclone-brpc]
+
+  --clean         Remove third_party/build, third_party/install and brpc/output first.
+  --reclone-brpc  Remove third_party/src/brpc and clone brpc again.
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --clean)
+      CLEAN_THIRD_PARTY=1
+      ;;
+    --reclone-brpc)
+      RECLEAN_BRPC_SRC=1
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "[error] unknown argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+  shift
+done
 
 if [ "$(id -u)" -ne 0 ]; then
   if command -v sudo >/dev/null 2>&1; then
@@ -122,6 +154,14 @@ echo "[info] kernel: $(uname -r)"
 echo "[info] root: ${ROOT_DIR}"
 echo "[info] project dir: ${SCRIPT_DIR}"
 echo "[info] third_party: ${THIRD_PARTY_DIR}"
+if [ "${CLEAN_THIRD_PARTY}" -eq 1 ]; then
+  echo "[step] Clean local third_party build artifacts"
+  rm -rf "${BUILD_DIR}" "${THIRD_PARTY_INSTALL_DIR}" "${BRPC_DIR}/output"
+fi
+if [ "${RECLEAN_BRPC_SRC}" -eq 1 ]; then
+  echo "[step] Remove local brpc source for clean clone"
+  rm -rf "${BRPC_DIR}"
+fi
 mkdir -p "${THIRD_PARTY_SRC_DIR}" "${THIRD_PARTY_INSTALL_DIR}"
 
 echo "[step] Install system dependencies"
@@ -180,7 +220,9 @@ rm -rf "${BUILD_DIR}/gflags"
 cmake -S "${GFLAGS_DIR}" -B "${BUILD_DIR}/gflags" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="${THIRD_PARTY_INSTALL_DIR}" \
-  -DBUILD_SHARED_LIBS=ON \
+  -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+  -DREGISTER_INSTALL_PREFIX=OFF \
+  -DBUILD_SHARED_LIBS=OFF \
   -DBUILD_STATIC_LIBS=ON \
   -DBUILD_TESTING=OFF
 cmake --build "${BUILD_DIR}/gflags" -j"${JOBS}"
@@ -192,8 +234,9 @@ rm -rf "${BUILD_DIR}/protobuf"
 cmake -S "${PROTOBUF_DIR}/cmake" -B "${BUILD_DIR}/protobuf" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="${THIRD_PARTY_INSTALL_DIR}" \
+  -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
   -Dprotobuf_BUILD_TESTS=OFF \
-  -Dprotobuf_BUILD_SHARED_LIBS=ON \
+  -Dprotobuf_BUILD_SHARED_LIBS=OFF \
   -DZLIB_ROOT="${THIRD_PARTY_INSTALL_DIR}" \
   -DCMAKE_PREFIX_PATH="${THIRD_PARTY_INSTALL_DIR}"
 cmake --build "${BUILD_DIR}/protobuf" -j"${JOBS}"
@@ -208,9 +251,10 @@ rm -rf "${BUILD_DIR}/snappy"
 cmake -S "${SNAPPY_DIR}" -B "${BUILD_DIR}/snappy" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="${THIRD_PARTY_INSTALL_DIR}" \
+  -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
   -DCMAKE_CXX_FLAGS="-Wno-error -Wno-error=sign-compare" \
   -DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG -Wno-error -Wno-error=sign-compare" \
-  -DBUILD_SHARED_LIBS=ON \
+  -DBUILD_SHARED_LIBS=OFF \
   -DSNAPPY_BUILD_TESTS=OFF \
   -DSNAPPY_BUILD_BENCHMARKS=OFF
 cmake --build "${BUILD_DIR}/snappy" -j"${JOBS}"
@@ -225,7 +269,8 @@ rm -rf "${BUILD_DIR}/leveldb"
 cmake -S "${LEVELDB_DIR}" -B "${BUILD_DIR}/leveldb" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="${THIRD_PARTY_INSTALL_DIR}" \
-  -DBUILD_SHARED_LIBS=ON \
+  -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+  -DBUILD_SHARED_LIBS=OFF \
   -DHAVE_TCMALLOC=0 \
   -DLEVELDB_BUILD_TESTS=OFF \
   -DLEVELDB_BUILD_BENCHMARKS=OFF \
@@ -245,13 +290,13 @@ fi
 )
 
 echo "[step] Validate local third-party prerequisites"
-check_local_dep "zlib.h" "libz.so"
-check_local_dep "openssl/ssl.h" "libssl.so"
-check_local_dep "gflags/gflags.h" "libgflags.so"
-check_local_dep "google/protobuf/service.h" "libprotobuf.so"
-check_local_dep "snappy.h" "libsnappy.so"
-check_local_dep "leveldb/db.h" "libleveldb.so"
-check_local_dep "liburing.h" "liburing.so"
+check_local_dep "zlib.h" "libz.a"
+check_local_dep "openssl/ssl.h" "libssl.a"
+check_local_dep "gflags/gflags.h" "libgflags.a"
+check_local_dep "google/protobuf/service.h" "libprotobuf.a"
+check_local_dep "snappy.h" "libsnappy.a"
+check_local_dep "leveldb/db.h" "libleveldb.a"
+check_local_dep "liburing.h" "liburing.a"
 if [ ! -x "${LOCAL_BIN}/protoc" ]; then
   echo "[error] missing protoc: ${LOCAL_BIN}/protoc" >&2
   exit 1
@@ -259,15 +304,14 @@ fi
 
 echo "[step] Clone/update and build brpc (${BRPC_BRANCH})"
 if [ ! -d "${BRPC_DIR}/.git" ]; then
-  git clone --branch "${BRPC_BRANCH}" "${BRPC_REPO}" "${BRPC_DIR}"
-else
-  (
-    cd "${BRPC_DIR}"
-    git fetch origin "${BRPC_BRANCH}"
-    git checkout "${BRPC_BRANCH}"
-    git pull --ff-only origin "${BRPC_BRANCH}"
-  )
+  git clone "${BRPC_REPO}" "${BRPC_DIR}"
 fi
+(
+  cd "${BRPC_DIR}"
+  git fetch origin "${BRPC_BRANCH}"
+  git checkout -B "${BRPC_BRANCH}" "origin/${BRPC_BRANCH}"
+  git reset --hard "origin/${BRPC_BRANCH}"
+)
 (
   cd "${BRPC_DIR}"
   sh config_brpc.sh \

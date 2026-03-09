@@ -1,33 +1,24 @@
 syntax = "proto3";
 
-package iouring_file_read;
+package readbench;
 
 option cc_generic_services = true;
 
-enum FileReadErrorCode {
-  FILE_READ_OK = 0;
-  FILE_READ_INVALID_ARGUMENT = 22;  // EINVAL
-  FILE_READ_IO_ERROR = 5;           // EIO
-  FILE_READ_TIMEOUT = 110;          // ETIMEDOUT
-  FILE_READ_INTERNAL = 500;
+message ReadRequest {
+  uint64 offset = 1;
+  uint32 len = 2;
 }
 
-message FileReadRequest {
-  int64 offset = 1;
-  int32 len = 2;
-  string path = 3;
-}
-
-message FileReadResponse {
+message ReadResponse {
   int32 code = 1;
   string message = 2;
   bytes body = 3;
 }
 
-service FileReadService {
-  rpc Read(FileReadRequest) returns (FileReadResponse);
+service IoUringReadService {
+  rpc Read(ReadRequest) returns (ReadResponse);
 }
 
-service BlockingFileReadService {
-  rpc Read(FileReadRequest) returns (FileReadResponse);
+service PreadReadService {
+  rpc Read(ReadRequest) returns (ReadResponse);
 }
