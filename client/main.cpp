@@ -7,7 +7,6 @@
 #include <iostream>
 #include <mutex>
 #include <numeric>
-#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -72,6 +71,38 @@ struct RuntimeStats {
   std::vector<uint32_t> all_latency_us;
 };
 
+// Fast non-cryptographic PRNG for request generation.
+class SplitMix64 {
+ public:
+  explicit SplitMix64(uint64_t seed) : state_(seed) {
+    if (state_ == 0) {
+      state_ = 0x9e3779b97f4a7c15ull;
+    }
+  }
+
+  uint64_t Next() {
+    uint64_t z = (state_ += 0x9e3779b97f4a7c15ull);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+    return z ^ (z >> 31);
+  }
+
+ private:
+  uint64_t state_;
+};
+
+inline uint64_t FastRange64(uint64_t random, uint64_t range) {
+  if (range == 0) {
+    return random;
+  }
+#if defined(__SIZEOF_INT128__)
+  return static_cast<uint64_t>(
+      (static_cast<unsigned __int128>(random) * range) >> 64);
+#else
+  return random % range;
+#endif
+}
+
 bool ParseTargetService(const std::string& text, TargetService* out) {
   if (out == nullptr) {
     return false;
@@ -113,20 +144,20 @@ uint64_t ResolveSeed() {
       std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
 }
 
-uint64_t RandomOffset(std::mt19937_64* rng) {
+uint64_t RandomOffset(SplitMix64* rng) {
   const uint64_t read_size = static_cast<uint64_t>(FLAGS_read_size);
   if (FLAGS_file_size <= read_size) {
     return 0;
   }
   const uint64_t max_offset = FLAGS_file_size - read_size;
   if (FLAGS_request_align <= 1) {
-    return (*rng)() % (max_offset + 1);
+    return FastRange64(rng->Next(), max_offset + 1);
   }
   const uint64_t slots = max_offset / FLAGS_request_align;
-  return ((*rng)() % (slots + 1)) * FLAGS_request_align;
+  return FastRange64(rng->Next(), slots + 1) * FLAGS_request_align;
 }
 
-void BuildReadRequest(std::mt19937_64* rng, readbench::ReadRequest* req) {
+void BuildReadRequest(SplitMix64* rng, readbench::ReadRequest* req) {
   req->set_len(static_cast<uint32_t>(FLAGS_read_size));
   req->set_offset(RandomOffset(rng));
 }
@@ -223,7 +254,8 @@ BenchResult RunTimedBench(const std::string& name, StubType* stub, uint64_t run_
   const auto begin = SteadyClock::now();
   for (int i = 0; i < FLAGS_concurrency; ++i) {
     workers.emplace_back([&, i]() {
-      std::mt19937_64 rng(run_seed + static_cast<uint64_t>(i) * 1315423911ull);
+      SplitMix64 rng(run_seed ^ (0x9e3779b97f4a7c15ull *
+                                 static_cast<uint64_t>(i + 1)));
       while (!stop.load(std::memory_order_relaxed)) {
         readbench::ReadRequest req;
         BuildReadRequest(&rng, &req);

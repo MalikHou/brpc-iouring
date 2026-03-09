@@ -2,6 +2,7 @@
 #include <fcntl.h>
 #include <linux/stat.h>
 #include <liburing.h>
+#include <sys/utsname.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -9,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <string>
@@ -68,6 +70,40 @@ struct DirectIoAlign {
 bool IsValidDirectIoAlign(size_t align) {
   return align >= sizeof(void*) &&
          (align & (align - 1)) == 0;
+}
+
+bool IsKernelVersionAtLeast(int target_major, int target_minor) {
+  struct utsname uts;
+  std::memset(&uts, 0, sizeof(uts));
+  if (uname(&uts) != 0) {
+    return false;
+  }
+  int major = 0;
+  int minor = 0;
+  if (std::sscanf(uts.release, "%d.%d", &major, &minor) != 2) {
+    return false;
+  }
+  if (major != target_major) {
+    return major > target_major;
+  }
+  return minor >= target_minor;
+}
+
+unsigned ResolveIouringInitFlags() {
+  static const unsigned kFlags = []() -> unsigned {
+    if (!IsKernelVersionAtLeast(6, 6)) {
+      return 0;
+    }
+    unsigned flags = 0;
+#ifdef IORING_SETUP_SINGLE_ISSUER
+    flags |= IORING_SETUP_SINGLE_ISSUER;
+#endif
+#ifdef IORING_SETUP_COOP_TASKRUN
+    flags |= IORING_SETUP_COOP_TASKRUN;
+#endif
+    return flags;
+  }();
+  return kFlags;
 }
 
 struct IoRequest {
@@ -152,6 +188,23 @@ class WorkerIoRing {
     if (FLAGS_iouring_queue_depth <= 0) {
       return EINVAL;
     }
+    const unsigned optimized_flags = ResolveIouringInitFlags();
+    if (optimized_flags != 0) {
+      const int opt_rc =
+          io_uring_queue_init(FLAGS_iouring_queue_depth, &ring_, optimized_flags);
+      if (opt_rc == 0) {
+        initialized_ = true;
+        LOG(INFO) << "io_uring_queue_init with optimized flags succeeded"
+                  << ", flags=0x" << std::hex << optimized_flags << std::dec;
+        return 0;
+      }
+      const int err = -opt_rc;
+      LOG(WARNING) << "io_uring_queue_init with optimized flags failed"
+                   << ", flags=0x" << std::hex << optimized_flags << std::dec
+                   << ", err=" << err << "(" << std::strerror(err) << ")"
+                   << ", fallback to flags=0";
+    }
+
     const int rc = io_uring_queue_init(FLAGS_iouring_queue_depth, &ring_, 0);
     if (rc < 0) {
       return -rc;
