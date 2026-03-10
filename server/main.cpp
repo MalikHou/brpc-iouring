@@ -49,6 +49,10 @@ DEFINE_int32(iouring_harvest_batch, 64, "max CQEs harvested per round");
 DEFINE_int32(monitor_tag, 0, "bthread tag for monitor server");
 DEFINE_int32(iouring_tag, 1, "bthread tag for io_uring server");
 DEFINE_int32(pread_tag, 2, "bthread tag for pread server");
+DEFINE_int64(active_task_idle_wait_ns, 500000,
+             "value injected into bthread_active_task_idle_wait_ns");
+DEFINE_int32(active_task_poll_every_nswitch, 4,
+             "value injected into bthread_active_task_poll_every_nswitch");
 
 namespace {
 
@@ -104,6 +108,15 @@ unsigned ResolveIouringInitFlags() {
     return flags;
   }();
   return kFlags;
+}
+
+void InjectActiveTaskFlags() {
+  google::SetCommandLineOption(
+      "bthread_active_task_idle_wait_ns",
+      std::to_string(FLAGS_active_task_idle_wait_ns).c_str());
+  google::SetCommandLineOption(
+      "bthread_active_task_poll_every_nswitch",
+      std::to_string(FLAGS_active_task_poll_every_nswitch).c_str());
 }
 
 struct IoRequest {
@@ -601,9 +614,16 @@ class PreadReadServiceImpl : public readbench::PreadReadService {
 
 int main(int argc, char* argv[]) {
   google::ParseCommandLineFlags(&argc, &argv, true);
+  if (FLAGS_active_task_idle_wait_ns < 0 ||
+      FLAGS_active_task_poll_every_nswitch <= 0) {
+    LOG(ERROR) << "invalid active-task flags: active_task_idle_wait_ns="
+               << FLAGS_active_task_idle_wait_ns
+               << " active_task_poll_every_nswitch="
+               << FLAGS_active_task_poll_every_nswitch;
+    return 1;
+  }
   brpc::FLAGS_event_dispatcher_edisp_unsched = true;
-  google::SetCommandLineOption("bthread_active_task_idle_wait_ns", "500000");  // 500us
-  google::SetCommandLineOption("bthread_active_task_poll_every_nswitch", "4");
+  InjectActiveTaskFlags();
   if (!ValidateAndInitTagLayout()) {
     return 1;
   }
@@ -728,6 +748,10 @@ int main(int argc, char* argv[]) {
             << monitor_options.num_threads << "/"
             << iouring_options.num_threads << "/"
             << pread_options.num_threads;
+  LOG(INFO) << "active_task_config idle_wait_ns="
+            << FLAGS_active_task_idle_wait_ns
+            << " poll_every_nswitch="
+            << FLAGS_active_task_poll_every_nswitch;
 
   monitor_server.RunUntilAskedToQuit();
 
