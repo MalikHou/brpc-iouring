@@ -95,8 +95,8 @@ dd if=/dev/urandom of=/data/read_bench.data bs=4M count=1024 status=progress
   --num_threads=5 \
   --monitor_num_threads=5 \
   --iouring_queue_depth=256 \
-  --active_task_idle_wait_ns=100000 \
-  --active_task_poll_every_nswitch=4 \
+  --bthread_active_task_idle_wait_ns=100000 \
+  --bthread_active_task_poll_every_nswitch=4 \
   --max_read_size=65536 \
   --file_direct_io=true
 ```
@@ -112,7 +112,7 @@ dd if=/dev/urandom of=/data/read_bench.data bs=4M count=1024 status=progress
 - 开启 `--file_direct_io=true` 时，请求 `offset/len` 需要按启动日志里的 `direct_io_offset_align` 对齐
 - direct io 场景建议在 client 侧设置 `--request_align=<direct_io_offset_align>`，并保证 `--read_size` 是该值的整数倍
 - 若 `--max_read_size < direct_io_offset_align`，server 会在启动时直接报错退出
-- `--active_task_idle_wait_ns` / `--active_task_poll_every_nswitch` 会显式注入到 bthread 的 active-task 内部参数
+- `--bthread_active_task_idle_wait_ns` / `--bthread_active_task_poll_every_nswitch` 直接控制 bthread active-task 参数
 
 ## 5. 启动 client（可按参数选择 io_uring / pread）
 

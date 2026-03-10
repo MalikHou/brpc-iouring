@@ -33,6 +33,11 @@
 
 DECLARE_int32(task_group_ntags);
 
+namespace bthread {
+DECLARE_int64(bthread_active_task_idle_wait_ns);
+DECLARE_int32(bthread_active_task_poll_every_nswitch);
+}  // namespace bthread
+
 DEFINE_int32(port, 8002, "io_uring server listen port");
 DEFINE_int32(pread_port, 8003, "pread server listen port");
 DEFINE_int32(monitor_port, 8010, "monitor server listen port");
@@ -49,10 +54,6 @@ DEFINE_int32(iouring_harvest_batch, 64, "max CQEs harvested per round");
 DEFINE_int32(monitor_tag, 0, "bthread tag for monitor server");
 DEFINE_int32(iouring_tag, 1, "bthread tag for io_uring server");
 DEFINE_int32(pread_tag, 2, "bthread tag for pread server");
-DEFINE_int64(active_task_idle_wait_ns, 500000,
-             "value injected into bthread_active_task_idle_wait_ns");
-DEFINE_int32(active_task_poll_every_nswitch, 4,
-             "value injected into bthread_active_task_poll_every_nswitch");
 
 namespace {
 
@@ -108,15 +109,6 @@ unsigned ResolveIouringInitFlags() {
     return flags;
   }();
   return kFlags;
-}
-
-void InjectActiveTaskFlags() {
-  google::SetCommandLineOption(
-      "bthread_active_task_idle_wait_ns",
-      std::to_string(FLAGS_active_task_idle_wait_ns).c_str());
-  google::SetCommandLineOption(
-      "bthread_active_task_poll_every_nswitch",
-      std::to_string(FLAGS_active_task_poll_every_nswitch).c_str());
 }
 
 struct IoRequest {
@@ -614,16 +606,7 @@ class PreadReadServiceImpl : public readbench::PreadReadService {
 
 int main(int argc, char* argv[]) {
   google::ParseCommandLineFlags(&argc, &argv, true);
-  if (FLAGS_active_task_idle_wait_ns < 0 ||
-      FLAGS_active_task_poll_every_nswitch <= 0) {
-    LOG(ERROR) << "invalid active-task flags: active_task_idle_wait_ns="
-               << FLAGS_active_task_idle_wait_ns
-               << " active_task_poll_every_nswitch="
-               << FLAGS_active_task_poll_every_nswitch;
-    return 1;
-  }
   brpc::FLAGS_event_dispatcher_edisp_unsched = true;
-  InjectActiveTaskFlags();
   if (!ValidateAndInitTagLayout()) {
     return 1;
   }
@@ -749,9 +732,9 @@ int main(int argc, char* argv[]) {
             << iouring_options.num_threads << "/"
             << pread_options.num_threads;
   LOG(INFO) << "active_task_config idle_wait_ns="
-            << FLAGS_active_task_idle_wait_ns
+            << bthread::FLAGS_bthread_active_task_idle_wait_ns
             << " poll_every_nswitch="
-            << FLAGS_active_task_poll_every_nswitch;
+            << bthread::FLAGS_bthread_active_task_poll_every_nswitch;
 
   monitor_server.RunUntilAskedToQuit();
 
