@@ -95,7 +95,7 @@ dd if=/dev/urandom of=/data/read_bench.data bs=4M count=1024 status=progress
   --num_threads=5 \
   --monitor_num_threads=5 \
   --iouring_queue_depth=256 \
-  --active_task_idle_wait_ns=500000 \
+  --active_task_idle_wait_ns=100000 \
   --active_task_poll_every_nswitch=4 \
   --max_read_size=65536 \
   --file_direct_io=true
